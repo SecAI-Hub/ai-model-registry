@@ -238,19 +238,29 @@ func main() {
 	case "list", "ls":
 		cmdList()
 	case "info":
-		if len(os.Args) < 3 { usage() }
+		if len(os.Args) < 3 {
+			usage()
+		}
 		cmdInfo(os.Args[2])
 	case "verify":
-		if len(os.Args) < 3 { usage() }
+		if len(os.Args) < 3 {
+			usage()
+		}
 		cmdVerify(os.Args[2])
 	case "path":
-		if len(os.Args) < 3 { usage() }
+		if len(os.Args) < 3 {
+			usage()
+		}
 		cmdPath(os.Args[2])
 	case "revoke":
-		if len(os.Args) < 3 { usage() }
+		if len(os.Args) < 3 {
+			usage()
+		}
 		cmdRevoke(os.Args[2])
 	case "delete", "rm":
-		if len(os.Args) < 3 { usage() }
+		if len(os.Args) < 3 {
+			usage()
+		}
 		cmdDelete(os.Args[2])
 	case "status":
 		cmdStatus()

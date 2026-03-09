@@ -30,14 +30,14 @@ const (
 
 // Artifact represents a model or related file in the registry.
 type Artifact struct {
-	Name        string            `json:"name" yaml:"name"`
-	Format      string            `json:"format" yaml:"format"`
-	Filename    string            `json:"filename" yaml:"filename"`
-	SHA256      string            `json:"sha256" yaml:"sha256"`
-	SizeBytes   int64             `json:"size_bytes" yaml:"size_bytes"`
-	Source      string            `json:"source,omitempty" yaml:"source,omitempty"`
-	PromotedAt  string            `json:"promoted_at" yaml:"promoted_at"`
-	State       ArtifactState     `json:"state" yaml:"state"`
+	Name            string            `json:"name" yaml:"name"`
+	Format          string            `json:"format" yaml:"format"`
+	Filename        string            `json:"filename" yaml:"filename"`
+	SHA256          string            `json:"sha256" yaml:"sha256"`
+	SizeBytes       int64             `json:"size_bytes" yaml:"size_bytes"`
+	Source          string            `json:"source,omitempty" yaml:"source,omitempty"`
+	PromotedAt      string            `json:"promoted_at" yaml:"promoted_at"`
+	State           ArtifactState     `json:"state" yaml:"state"`
 	ScanResults     map[string]string `json:"scan_results,omitempty" yaml:"scan_results,omitempty"`
 	ScannerVersions map[string]string `json:"scanner_versions,omitempty" yaml:"scanner_versions,omitempty"`
 	PolicyVersion   string            `json:"policy_version,omitempty" yaml:"policy_version,omitempty"`
@@ -61,17 +61,17 @@ type ModelsLock struct {
 
 // PromoteRequest is sent by the promotion pipeline to admit an artifact.
 type PromoteRequest struct {
-	Name        string            `json:"name"`
-	Filename    string            `json:"filename"`
-	SHA256      string            `json:"sha256"`
-	SizeBytes   int64             `json:"size_bytes"`
-	Source      string            `json:"source,omitempty"`
-	ScanResults     map[string]string `json:"scan_results,omitempty"`
-	ScannerVersions map[string]string `json:"scanner_versions,omitempty"`
-	PolicyVersion   string            `json:"policy_version,omitempty"`
-	SourceRevision  string            `json:"source_revision,omitempty"`
-	GGUFGuardFingerprint map[string]any `json:"gguf_guard_fingerprint,omitempty"`
-	GGUFGuardManifest    string         `json:"gguf_guard_manifest,omitempty"`
+	Name                 string            `json:"name"`
+	Filename             string            `json:"filename"`
+	SHA256               string            `json:"sha256"`
+	SizeBytes            int64             `json:"size_bytes"`
+	Source               string            `json:"source,omitempty"`
+	ScanResults          map[string]string `json:"scan_results,omitempty"`
+	ScannerVersions      map[string]string `json:"scanner_versions,omitempty"`
+	PolicyVersion        string            `json:"policy_version,omitempty"`
+	SourceRevision       string            `json:"source_revision,omitempty"`
+	GGUFGuardFingerprint map[string]any    `json:"gguf_guard_fingerprint,omitempty"`
+	GGUFGuardManifest    string            `json:"gguf_guard_manifest,omitempty"`
 }
 
 var (
@@ -340,18 +340,18 @@ func handlePromote(w http.ResponseWriter, r *http.Request) {
 	}
 
 	artifact := Artifact{
-		Name:            req.Name,
-		Format:          format,
-		Filename:        req.Filename,
-		SHA256:          actualHash,
-		SizeBytes:       info.Size(),
-		Source:          req.Source,
-		PromotedAt:      time.Now().UTC().Format(time.RFC3339),
-		State:           StateTrusted,
-		ScanResults:     req.ScanResults,
-		ScannerVersions: req.ScannerVersions,
-		PolicyVersion:   req.PolicyVersion,
-		SourceRevision:  req.SourceRevision,
+		Name:                 req.Name,
+		Format:               format,
+		Filename:             req.Filename,
+		SHA256:               actualHash,
+		SizeBytes:            info.Size(),
+		Source:               req.Source,
+		PromotedAt:           time.Now().UTC().Format(time.RFC3339),
+		State:                StateTrusted,
+		ScanResults:          req.ScanResults,
+		ScannerVersions:      req.ScannerVersions,
+		PolicyVersion:        req.PolicyVersion,
+		SourceRevision:       req.SourceRevision,
 		GGUFGuardFingerprint: req.GGUFGuardFingerprint,
 		GGUFGuardManifest:    req.GGUFGuardManifest,
 	}
