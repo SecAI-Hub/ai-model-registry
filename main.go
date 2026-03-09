@@ -19,14 +19,26 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// ArtifactState represents the trust state of an artifact in the registry.
+// ArtifactState represents the lifecycle state of an artifact in the registry.
 // Only artifacts in "trusted" state are available for runtime consumption.
 type ArtifactState string
 
 const (
-	StateTrusted ArtifactState = "trusted"
-	StateRevoked ArtifactState = "revoked"
+	StateAcquired    ArtifactState = "acquired"    // downloaded/received but not yet scanned
+	StateQuarantined ArtifactState = "quarantined" // being scanned by quarantine pipeline
+	StateTrusted     ArtifactState = "trusted"     // all checks passed, available for runtime
+	StateRevoked     ArtifactState = "revoked"     // revoked, blocked from runtime use
+	StateDeleted     ArtifactState = "deleted"     // soft-deleted, metadata retained for audit
 )
+
+// validStates is the set of all recognized artifact states.
+var validStates = map[ArtifactState]bool{
+	StateAcquired:    true,
+	StateQuarantined: true,
+	StateTrusted:     true,
+	StateRevoked:     true,
+	StateDeleted:     true,
+}
 
 // Artifact represents a model or related file in the registry.
 type Artifact struct {
@@ -363,6 +375,15 @@ func handlePromote(w http.ResponseWriter, r *http.Request) {
 	replaced := false
 	for i, m := range manifest.Models {
 		if m.Name == req.Name {
+			// Block promotion of deleted artifacts
+			if m.State == StateDeleted {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				json.NewEncoder(w).Encode(map[string]string{
+					"error": fmt.Sprintf("cannot promote artifact %q: currently in deleted state", req.Name),
+				})
+				return
+			}
 			manifest.Models[i] = artifact
 			replaced = true
 			break
@@ -384,6 +405,8 @@ func handlePromote(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(artifact)
 }
 
+// handleDelete performs a soft delete — sets state to "deleted" and removes the
+// file from disk, but retains metadata in the manifest for audit purposes.
 func handleDelete(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -399,35 +422,33 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 	manifestMu.Lock()
 	defer manifestMu.Unlock()
 
-	found := false
-	filtered := make([]Artifact, 0, len(manifest.Models))
-	for _, m := range manifest.Models {
+	for i, m := range manifest.Models {
 		if m.Name == name {
-			found = true
-			// Remove the model file from disk
+			if m.State == StateDeleted {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]string{
+					"status": "already_deleted",
+					"name":   name,
+				})
+				return
+			}
+			manifest.Models[i].State = StateDeleted
+			// Remove the model file from disk but keep metadata
 			filePath := filepath.Join(registryDir, m.Filename)
 			if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
 				log.Printf("warning: could not remove %s: %v", filePath, err)
 			}
-			log.Printf("REMOVED: %s (%s)", m.Name, m.Filename)
-		} else {
-			filtered = append(filtered, m)
+			if err := saveManifest(); err != nil {
+				http.Error(w, fmt.Sprintf("failed to save manifest: %v", err), http.StatusInternalServerError)
+				return
+			}
+			log.Printf("DELETED (soft): %s (%s) sha256=%s", m.Name, m.Filename, m.SHA256)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"status": "deleted", "name": name})
+			return
 		}
 	}
-
-	if !found {
-		http.Error(w, "model not found", http.StatusNotFound)
-		return
-	}
-
-	manifest.Models = filtered
-	if err := saveManifest(); err != nil {
-		http.Error(w, fmt.Sprintf("failed to save manifest: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "deleted", "name": name})
+	http.Error(w, "model not found", http.StatusNotFound)
 }
 
 // handleRevoke marks an artifact as revoked without deleting it from disk.
@@ -457,6 +478,14 @@ func handleRevoke(w http.ResponseWriter, r *http.Request) {
 				})
 				return
 			}
+			if m.State == StateDeleted {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				json.NewEncoder(w).Encode(map[string]string{
+					"error": fmt.Sprintf("cannot revoke artifact %q: already in deleted state", name),
+				})
+				return
+			}
 			manifest.Models[i].State = StateRevoked
 			if err := saveManifest(); err != nil {
 				http.Error(w, fmt.Sprintf("failed to save manifest: %v", err), http.StatusInternalServerError)
@@ -466,6 +495,129 @@ func handleRevoke(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]string{
 				"status": "revoked",
+				"name":   name,
+			})
+			return
+		}
+	}
+	http.Error(w, "model not found", http.StatusNotFound)
+}
+
+// AcquireRequest is sent when an artifact is first received/downloaded.
+type AcquireRequest struct {
+	Name     string `json:"name"`
+	Filename string `json:"filename"`
+	SHA256   string `json:"sha256"`
+	SizeBytes int64 `json:"size_bytes"`
+	Source   string `json:"source,omitempty"`
+}
+
+// handleAcquire registers a newly downloaded artifact in "acquired" state.
+func handleAcquire(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req AcquireRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.Name == "" || req.Filename == "" {
+		http.Error(w, "name and filename are required", http.StatusBadRequest)
+		return
+	}
+
+	format := formatFromFilename(req.Filename)
+	if !allowedFmts[format] {
+		http.Error(w, fmt.Sprintf("format %q not allowed; permitted: gguf, safetensors", format), http.StatusForbidden)
+		return
+	}
+
+	artifact := Artifact{
+		Name:       req.Name,
+		Format:     format,
+		Filename:   req.Filename,
+		SHA256:     req.SHA256,
+		SizeBytes:  req.SizeBytes,
+		Source:     req.Source,
+		PromotedAt: time.Now().UTC().Format(time.RFC3339),
+		State:      StateAcquired,
+	}
+
+	manifestMu.Lock()
+	defer manifestMu.Unlock()
+
+	// Replace existing entry with same name, or append
+	replaced := false
+	for i, m := range manifest.Models {
+		if m.Name == req.Name {
+			manifest.Models[i] = artifact
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		manifest.Models = append(manifest.Models, artifact)
+	}
+
+	if err := saveManifest(); err != nil {
+		http.Error(w, fmt.Sprintf("failed to save manifest: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("ACQUIRED: %s (%s) state=%s", artifact.Name, artifact.Filename, artifact.State)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(artifact)
+}
+
+// handleQuarantine transitions an artifact from "acquired" to "quarantined" state.
+func handleQuarantine(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		http.Error(w, "missing ?name= parameter", http.StatusBadRequest)
+		return
+	}
+
+	manifestMu.Lock()
+	defer manifestMu.Unlock()
+
+	for i, m := range manifest.Models {
+		if m.Name == name {
+			if m.State == StateQuarantined {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]string{
+					"status": "already_quarantined",
+					"name":   name,
+				})
+				return
+			}
+			if m.State != StateAcquired {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				json.NewEncoder(w).Encode(map[string]string{
+					"error": fmt.Sprintf("cannot quarantine artifact %q: must be in acquired state, currently %s", name, m.State),
+				})
+				return
+			}
+			manifest.Models[i].State = StateQuarantined
+			if err := saveManifest(); err != nil {
+				http.Error(w, fmt.Sprintf("failed to save manifest: %v", err), http.StatusInternalServerError)
+				return
+			}
+			log.Printf("QUARANTINED: %s (%s) sha256=%s", m.Name, m.Filename, m.SHA256)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{
+				"status": "quarantined",
 				"name":   name,
 			})
 			return
@@ -603,18 +755,17 @@ func handleVerifyModel(w http.ResponseWriter, r *http.Request) {
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	manifestMu.RLock()
 	count := len(manifest.Models)
-	trustedCount := 0
+	stateCounts := map[string]int{}
 	for _, m := range manifest.Models {
-		if m.State == StateTrusted {
-			trustedCount++
-		}
+		stateCounts[string(m.State)]++
 	}
 	manifestMu.RUnlock()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":        "ok",
 		"model_count":   count,
-		"trusted_count": trustedCount,
+		"trusted_count": stateCounts["trusted"],
+		"state_counts":  stateCounts,
 		"registry_dir":  registryDir,
 		"auth_required": !insecureDevMode || serviceToken != "",
 	})
@@ -724,6 +875,8 @@ func main() {
 	mux.HandleFunc("/v1/integrity/status", handleIntegrityStatus)
 	mux.HandleFunc("/v1/model/verify-manifest", handleVerifyGGUFManifest)
 	// Mutating endpoints — require service token (fail-closed)
+	mux.HandleFunc("/v1/model/acquire", requireServiceToken(handleAcquire))
+	mux.HandleFunc("/v1/model/quarantine", requireServiceToken(handleQuarantine))
 	mux.HandleFunc("/v1/model/promote", requireServiceToken(handlePromote))
 	mux.HandleFunc("/v1/model/delete", requireServiceToken(handleDelete))
 	mux.HandleFunc("/v1/model/revoke", requireServiceToken(handleRevoke))

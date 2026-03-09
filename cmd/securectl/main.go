@@ -22,13 +22,20 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `securectl - AI model registry management CLI
 
 Usage:
-  securectl list                     List all models in the registry
+  securectl list                     List all models (all states)
   securectl info <name>              Show details for a model
   securectl verify <name>            Verify a model's hash against manifest
   securectl path <name>              Print the filesystem path of a model
   securectl revoke <name>            Revoke a model (mark as untrusted)
-  securectl delete <name>            Remove a model from the registry
+  securectl delete <name>            Soft-delete a model (metadata retained)
   securectl status                   Show registry service health
+
+Artifact states:
+  acquired      Downloaded/received, not yet scanned
+  quarantined   Being scanned by quarantine pipeline
+  trusted       All checks passed, available for runtime
+  revoked       Revoked, blocked from runtime use
+  deleted       Soft-deleted, metadata retained for audit
 
 Environment:
   REGISTRY_URL   Registry endpoint (default: http://127.0.0.1:8470)
@@ -197,7 +204,11 @@ func cmdDelete(name string) {
 	}
 	var result map[string]string
 	json.Unmarshal(data, &result)
-	fmt.Printf("Deleted: %s\n", name)
+	if result["status"] == "already_deleted" {
+		fmt.Printf("Already deleted: %s\n", name)
+	} else {
+		fmt.Printf("Deleted (soft): %s — metadata retained for audit\n", name)
+	}
 }
 
 func cmdStatus() {
