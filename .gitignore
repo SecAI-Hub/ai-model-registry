@@ -1,6 +1,6 @@
-# Binaries
-registry
-securectl
+# Binaries (root-level only)
+/registry
+/securectl
 *.exe
 
 # Go
