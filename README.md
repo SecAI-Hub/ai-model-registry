@@ -150,7 +150,6 @@ The registry stores the following metadata for each artifact:
 | `REGISTRY_LOCK_PATH` | `/etc/secure-ai/policy/models.lock.yaml` | Baked-in fallback manifest |
 | `SERVICE_TOKEN_PATH` | `/run/secure-ai/service-token` | Bearer token file for auth |
 | `INTEGRITY_RESULT_PATH` | `/var/lib/secure-ai/logs/integrity-last.json` | Last integrity check result |
-| `INSECURE_DEV_MODE` | `false` | Allow mutations without token (**development only** — see below) |
 
 ## Deployment profiles
 
