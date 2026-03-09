@@ -505,11 +505,11 @@ func handleRevoke(w http.ResponseWriter, r *http.Request) {
 
 // AcquireRequest is sent when an artifact is first received/downloaded.
 type AcquireRequest struct {
-	Name     string `json:"name"`
-	Filename string `json:"filename"`
-	SHA256   string `json:"sha256"`
-	SizeBytes int64 `json:"size_bytes"`
-	Source   string `json:"source,omitempty"`
+	Name      string `json:"name"`
+	Filename  string `json:"filename"`
+	SHA256    string `json:"sha256"`
+	SizeBytes int64  `json:"size_bytes"`
+	Source    string `json:"source,omitempty"`
 }
 
 // handleAcquire registers a newly downloaded artifact in "acquired" state.

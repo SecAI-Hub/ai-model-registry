@@ -6,7 +6,7 @@
 
 A lightweight HTTP service that manages the lifecycle of AI artifacts with a strict trust model:
 - Default-deny: artifacts must be explicitly promoted before runtime use
-- Explicit states: trusted, revoked (with audit trail)
+- Explicit states: acquired, quarantined, trusted, revoked, deleted (with audit trail)
 - Fail-closed auth: mutations blocked without service token
 - Digest-based: SHA-256 verification on every operation
 - Immutable boot fallback via models.lock.yaml
@@ -21,9 +21,11 @@ A lightweight HTTP service that manages the lifecycle of AI artifacts with a str
 - POST /v1/models/verify-all — batch integrity verification
 - GET /v1/integrity/status — last integrity check result
 - POST /v1/model/verify-manifest?name=X — verify GGUF per-tensor manifest
+- POST /v1/model/acquire — register newly received artifact (auth required)
+- POST /v1/model/quarantine?name=X — move artifact to quarantine (auth required)
 - POST /v1/model/promote — promote artifact to trusted state (auth required)
 - POST /v1/model/revoke?name=X — revoke artifact (auth required)
-- DELETE /v1/model/delete?name=X — remove artifact (auth required)
+- DELETE /v1/model/delete?name=X — soft-delete artifact (auth required)
 
 ## Key design decisions
 
