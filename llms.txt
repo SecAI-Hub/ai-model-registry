@@ -1,0 +1,49 @@
+# ai-model-registry
+
+> Security-first AI artifact registry — digest-based storage, policy-gated promotion, signed provenance, and reproducible trust metadata for local models, adapters, tokenizers, and related files.
+
+## What it is
+
+A lightweight HTTP service that manages the lifecycle of AI artifacts with a strict trust model:
+- Default-deny: artifacts must be explicitly promoted before runtime use
+- Explicit states: trusted, revoked (with audit trail)
+- Fail-closed auth: mutations blocked without service token
+- Digest-based: SHA-256 verification on every operation
+- Immutable boot fallback via models.lock.yaml
+
+## API endpoints
+
+- GET /health — health check
+- GET /v1/models — list all artifacts
+- GET /v1/model?name=X — get artifact details
+- GET /v1/model/path?name=X — get filesystem path (trusted only)
+- POST /v1/model/verify?name=X — verify artifact hash
+- POST /v1/models/verify-all — batch integrity verification
+- GET /v1/integrity/status — last integrity check result
+- POST /v1/model/verify-manifest?name=X — verify GGUF per-tensor manifest
+- POST /v1/model/promote — promote artifact to trusted state (auth required)
+- POST /v1/model/revoke?name=X — revoke artifact (auth required)
+- DELETE /v1/model/delete?name=X — remove artifact (auth required)
+
+## Key design decisions
+
+- Only gguf and safetensors formats allowed (pickle blocked by design)
+- /v1/model/path blocks revoked artifacts with 403
+- Service token uses constant-time comparison
+- No database — manifest.json + models.lock.yaml only
+- Single Go binary, zero external dependencies beyond yaml.v3
+- Appliance mode: 127.0.0.1 only, strict auth, baked-in fallback
+- Standalone mode: same secure defaults, broader configuration options
+
+## Quick start
+
+```bash
+go build -o registry .
+REGISTRY_DIR=/tmp/models INSECURE_DEV_MODE=true ./registry
+```
+
+## Links
+
+- Repository: https://github.com/SecAI-Hub/ai-model-registry
+- OpenAPI spec: schemas/openapi.yaml
+- Policy schema: schemas/artifact.schema.json

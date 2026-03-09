@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build, Test & Vet
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: "1.23"
+
+      - name: Build registry
+        run: CGO_ENABLED=0 go build -ldflags="-s -w" -o /dev/null .
+
+      - name: Build securectl
+        run: CGO_ENABLED=0 go build -ldflags="-s -w" -o /dev/null ./cmd/securectl/
+
+      - name: Test
+        run: go test -v -race -count=1 ./...
+
+      - name: Vet
+        run: go vet ./...
+
+  container:
+    name: Container Build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build container image
+        run: docker build -f Containerfile -t ai-model-registry:test .

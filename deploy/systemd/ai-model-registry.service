@@ -1,0 +1,66 @@
+[Unit]
+Description=AI Model Registry (security-first artifact lifecycle)
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/registry
+Environment=BIND_ADDR=127.0.0.1:8470
+Environment=REGISTRY_DIR=/var/lib/ai-model-registry/data
+Environment=SERVICE_TOKEN_PATH=/run/ai-model-registry/service-token
+Environment=INTEGRITY_RESULT_PATH=/var/lib/ai-model-registry/logs/integrity-last.json
+
+# Filesystem isolation
+DynamicUser=yes
+StateDirectory=ai-model-registry
+LogsDirectory=ai-model-registry
+ReadWritePaths=/var/lib/ai-model-registry
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProcSubset=pid
+
+# Kernel protection
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# Privilege restriction
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+RestrictRealtime=yes
+
+# Capability bounding
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Namespace restrictions
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+PrivateUsers=yes
+
+# Syscall filtering
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @clock @debug @swap @reboot @raw-io @module @cpu-emulation @obsolete
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+
+# Resource limits
+MemoryMax=512M
+CPUQuota=50%
+TasksMax=64
+LimitNOFILE=1024
+LimitCORE=0
+
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

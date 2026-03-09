@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/SecAI-Hub/ai-model-registry/schemas/artifact.schema.json",
+  "title": "AI Model Registry Artifact",
+  "description": "Schema for artifacts stored in the ai-model-registry manifest",
+  "type": "object",
+  "required": ["name", "format", "filename", "sha256", "state"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Human-readable artifact name (unique within registry)",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "format": {
+      "type": "string",
+      "description": "Artifact format, inferred from filename extension",
+      "enum": ["gguf", "safetensors"]
+    },
+    "filename": {
+      "type": "string",
+      "description": "Filename on disk within the registry directory",
+      "minLength": 1
+    },
+    "sha256": {
+      "type": "string",
+      "description": "SHA-256 digest of the artifact file",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "size_bytes": {
+      "type": "integer",
+      "description": "File size in bytes",
+      "minimum": 0
+    },
+    "source": {
+      "type": "string",
+      "description": "Origin URL or identifier (e.g. Hugging Face repo)"
+    },
+    "promoted_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp of when the artifact was promoted"
+    },
+    "state": {
+      "type": "string",
+      "description": "Trust state — only 'trusted' artifacts can be loaded at runtime",
+      "enum": ["trusted", "revoked"],
+      "default": "trusted"
+    },
+    "scan_results": {
+      "type": "object",
+      "description": "Results from security scanners (e.g. modelscan, gguf-guard)",
+      "additionalProperties": { "type": "string" }
+    },
+    "scanner_versions": {
+      "type": "object",
+      "description": "Versions of scanners used during quarantine",
+      "additionalProperties": { "type": "string" }
+    },
+    "policy_version": {
+      "type": "string",
+      "description": "Version of the promotion policy applied"
+    },
+    "source_revision": {
+      "type": "string",
+      "description": "Source revision (e.g. Hugging Face commit hash)"
+    },
+    "gguf_guard_fingerprint": {
+      "type": "object",
+      "description": "Per-tensor fingerprint from gguf-guard (GGUF files only)"
+    },
+    "gguf_guard_manifest": {
+      "type": "string",
+      "description": "Path to the gguf-guard integrity manifest file"
+    }
+  },
+  "additionalProperties": false
+}

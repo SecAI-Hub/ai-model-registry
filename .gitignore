@@ -1,0 +1,27 @@
+# Binaries
+registry
+securectl
+*.exe
+
+# Go
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test
+*.test
+coverage.out
+
+# Runtime artifacts
+manifest.json
+*.gguf
+*.safetensors
+*.jsonl

@@ -1,0 +1,374 @@
+openapi: "3.0.3"
+info:
+  title: ai-model-registry API
+  version: "1.0.0"
+  description: >
+    Security-first AI artifact registry with digest-based storage,
+    policy-gated promotion, explicit trust states, and fail-closed
+    authentication for mutating operations.
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+servers:
+  - url: http://127.0.0.1:8470
+    description: Local (appliance mode)
+
+paths:
+  /health:
+    get:
+      summary: Health check
+      operationId: getHealth
+      tags: [monitoring]
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "ok"
+                  model_count:
+                    type: integer
+                  trusted_count:
+                    type: integer
+                  registry_dir:
+                    type: string
+                  auth_required:
+                    type: boolean
+
+  /v1/models:
+    get:
+      summary: List all artifacts
+      operationId: listModels
+      tags: [artifacts]
+      responses:
+        "200":
+          description: Array of artifacts
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Artifact"
+
+  /v1/model:
+    get:
+      summary: Get a single artifact by name
+      operationId: getModel
+      tags: [artifacts]
+      parameters:
+        - name: name
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Artifact details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Artifact"
+        "404":
+          description: Model not found
+
+  /v1/model/path:
+    get:
+      summary: Get filesystem path for a trusted artifact
+      operationId: getModelPath
+      tags: [artifacts]
+      parameters:
+        - name: name
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Filesystem path
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  path:
+                    type: string
+        "403":
+          description: Artifact is not in trusted state
+        "404":
+          description: Model not found or file missing
+
+  /v1/model/verify:
+    post:
+      summary: Verify artifact hash integrity
+      operationId: verifyModel
+      tags: [integrity]
+      parameters:
+        - name: name
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Hash verified
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VerifyResult"
+        "404":
+          description: Model not found
+        "409":
+          description: Hash mismatch (tampered)
+
+  /v1/models/verify-all:
+    post:
+      summary: Batch integrity verification
+      operationId: verifyAll
+      tags: [integrity]
+      responses:
+        "200":
+          description: All models verified
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VerifyAllResult"
+        "409":
+          description: One or more models failed verification
+
+  /v1/integrity/status:
+    get:
+      summary: Last integrity check result
+      operationId: getIntegrityStatus
+      tags: [monitoring]
+      responses:
+        "200":
+          description: Integrity status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "ok"
+
+  /v1/model/verify-manifest:
+    post:
+      summary: Verify GGUF per-tensor manifest via gguf-guard
+      operationId: verifyGGUFManifest
+      tags: [integrity]
+      parameters:
+        - name: name
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Manifest verified or skipped
+        "404":
+          description: Model not found
+        "409":
+          description: Manifest verification failed
+
+  /v1/model/promote:
+    post:
+      summary: Promote artifact to trusted state
+      operationId: promoteModel
+      tags: [lifecycle]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PromoteRequest"
+      responses:
+        "201":
+          description: Artifact promoted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Artifact"
+        "400":
+          description: Invalid request
+        "403":
+          description: Auth required or format not allowed
+        "409":
+          description: Hash verification failed
+
+  /v1/model/revoke:
+    post:
+      summary: Revoke artifact (mark as untrusted)
+      operationId: revokeModel
+      tags: [lifecycle]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: name
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Artifact revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [revoked, already_revoked]
+                  name:
+                    type: string
+        "403":
+          description: Auth required
+        "404":
+          description: Model not found
+
+  /v1/model/delete:
+    delete:
+      summary: Remove artifact from registry and disk
+      operationId: deleteModel
+      tags: [lifecycle]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: name
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Artifact deleted
+        "403":
+          description: Auth required
+        "404":
+          description: Model not found
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Service-to-service token
+
+  schemas:
+    Artifact:
+      type: object
+      required: [name, format, filename, sha256, state]
+      properties:
+        name:
+          type: string
+        format:
+          type: string
+          enum: [gguf, safetensors]
+        filename:
+          type: string
+        sha256:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+        size_bytes:
+          type: integer
+          format: int64
+        source:
+          type: string
+        promoted_at:
+          type: string
+          format: date-time
+        state:
+          type: string
+          enum: [trusted, revoked]
+          description: Trust state — only trusted artifacts can be loaded at runtime
+        scan_results:
+          type: object
+          additionalProperties:
+            type: string
+        scanner_versions:
+          type: object
+          additionalProperties:
+            type: string
+        policy_version:
+          type: string
+        source_revision:
+          type: string
+        gguf_guard_fingerprint:
+          type: object
+        gguf_guard_manifest:
+          type: string
+
+    PromoteRequest:
+      type: object
+      required: [name, filename, sha256]
+      properties:
+        name:
+          type: string
+        filename:
+          type: string
+        sha256:
+          type: string
+        size_bytes:
+          type: integer
+        source:
+          type: string
+        scan_results:
+          type: object
+          additionalProperties:
+            type: string
+        scanner_versions:
+          type: object
+          additionalProperties:
+            type: string
+        policy_version:
+          type: string
+        source_revision:
+          type: string
+        gguf_guard_fingerprint:
+          type: object
+        gguf_guard_manifest:
+          type: string
+
+    VerifyResult:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [verified, failed]
+        name:
+          type: string
+        sha256:
+          type: string
+        state:
+          type: string
+        safe_to_use:
+          type: string
+          enum: ["true", "false"]
+
+    VerifyAllResult:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok, failed]
+        models:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              status:
+                type: string
+              sha256:
+                type: string
+        checked:
+          type: integer

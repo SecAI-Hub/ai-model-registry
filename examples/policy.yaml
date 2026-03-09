@@ -1,0 +1,57 @@
+# ai-model-registry — example policy configuration
+#
+# This file is NOT loaded by the registry itself. It documents the
+# recommended policy settings for a quarantine pipeline that promotes
+# artifacts into the registry.
+#
+# The registry enforces: format allowlist, hash verification, and
+# service token auth. Everything else is the pipeline's responsibility.
+
+# Allowed artifact formats (enforced by registry)
+models:
+  allowed_formats:
+    - gguf          # GGUF quantized models (llama.cpp, etc.)
+    - safetensors   # SafeTensors format (Hugging Face)
+  deny_formats:
+    - pickle        # Python pickle — arbitrary code execution risk
+    - pt            # PyTorch native — uses pickle internally
+    - bin           # Ambiguous format — not self-describing
+
+# Quarantine pipeline stages (enforced by pipeline, not registry)
+quarantine:
+  stages:
+    - name: source_check
+      description: Verify artifact origin against allowlist
+      required: true
+
+    - name: format_gate
+      description: Reject disallowed formats
+      required: true
+
+    - name: hash_verify
+      description: Compute and record SHA-256 digest
+      required: true
+
+    - name: static_scan
+      description: Run security scanners (modelscan, gguf-guard, fickling)
+      required: true
+      scanners:
+        - modelscan    # General model security scanner
+        - gguf-guard   # GGUF-specific tensor integrity
+
+    - name: smoke_test
+      description: Load model and verify basic inference
+      required: false  # Optional — depends on compute availability
+
+# Sources allowlist (enforced by pipeline, not registry)
+sources:
+  - origin: "https://huggingface.co/"
+    signature_required: false
+    formats: ["gguf", "safetensors"]
+
+# Promotion requirements (all must pass before calling POST /v1/model/promote)
+promotion:
+  require_hash: true
+  require_scan_results: true
+  require_format_check: true
+  require_source_check: true
