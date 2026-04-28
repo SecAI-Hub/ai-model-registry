@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
@@ -11,9 +12,11 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -219,6 +222,32 @@ func formatFromFilename(filename string) string {
 	}
 }
 
+func registryPath(filename string) (string, error) {
+	if filename == "" {
+		return "", fmt.Errorf("empty filename")
+	}
+	if strings.ContainsRune(filename, 0) {
+		return "", fmt.Errorf("filename contains null byte")
+	}
+
+	clean := filepath.Clean(filename)
+	if filepath.IsAbs(clean) {
+		rel, err := filepath.Rel(registryDir, clean)
+		if err != nil {
+			return "", fmt.Errorf("cannot resolve filename: %w", err)
+		}
+		if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+			return "", fmt.Errorf("filename escapes registry directory")
+		}
+		return clean, nil
+	}
+
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("filename escapes registry directory")
+	}
+	return filepath.Join(registryDir, clean), nil
+}
+
 // verifyFileHash computes sha256 of a file and compares to expected.
 func verifyFileHash(path, expected string) (string, error) {
 	f, err := os.Open(path)
@@ -299,7 +328,11 @@ func handleModelPath(w http.ResponseWriter, r *http.Request) {
 				})
 				return
 			}
-			path := filepath.Join(registryDir, m.Filename)
+			path, err := registryPath(m.Filename)
+			if err != nil {
+				http.Error(w, "invalid registry filename", http.StatusInternalServerError)
+				return
+			}
 			if _, err := os.Stat(path); err != nil {
 				http.Error(w, "model file not found on disk", http.StatusNotFound)
 				return
@@ -329,6 +362,12 @@ func handlePromote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	filePath, err := registryPath(req.Filename)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("invalid filename: %v", err), http.StatusBadRequest)
+		return
+	}
+
 	// Validate format
 	format := formatFromFilename(req.Filename)
 	if !allowedFmts[format] {
@@ -337,7 +376,6 @@ func handlePromote(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Verify the file exists in the registry directory and hash matches
-	filePath := filepath.Join(registryDir, req.Filename)
 	actualHash, err := verifyFileHash(filePath, req.SHA256)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("hash verification failed: %v", err), http.StatusConflict)
@@ -434,7 +472,11 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 			}
 			manifest.Models[i].State = StateDeleted
 			// Remove the model file from disk but keep metadata
-			filePath := filepath.Join(registryDir, m.Filename)
+			filePath, err := registryPath(m.Filename)
+			if err != nil {
+				http.Error(w, "invalid registry filename", http.StatusInternalServerError)
+				return
+			}
 			if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
 				log.Printf("warning: could not remove %s: %v", filePath, err)
 			}
@@ -527,6 +569,10 @@ func handleAcquire(w http.ResponseWriter, r *http.Request) {
 
 	if req.Name == "" || req.Filename == "" {
 		http.Error(w, "name and filename are required", http.StatusBadRequest)
+		return
+	}
+	if _, err := registryPath(req.Filename); err != nil {
+		http.Error(w, fmt.Sprintf("invalid filename: %v", err), http.StatusBadRequest)
 		return
 	}
 
@@ -641,7 +687,16 @@ func handleVerifyAll(w http.ResponseWriter, r *http.Request) {
 	allOk := true
 
 	for _, m := range models {
-		filePath := filepath.Join(registryDir, m.Filename)
+		filePath, err := registryPath(m.Filename)
+		if err != nil {
+			allOk = false
+			results = append(results, map[string]string{
+				"name":   m.Name,
+				"status": "failed",
+				"error":  "invalid registry filename",
+			})
+			continue
+		}
 		actual, err := verifyFileHash(filePath, m.SHA256)
 		if err != nil {
 			allOk = false
@@ -719,7 +774,18 @@ func handleVerifyModel(w http.ResponseWriter, r *http.Request) {
 
 	for _, m := range manifest.Models {
 		if m.Name == name {
-			filePath := filepath.Join(registryDir, m.Filename)
+			filePath, err := registryPath(m.Filename)
+			if err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				json.NewEncoder(w).Encode(map[string]string{
+					"status":      "failed",
+					"name":        name,
+					"error":       "invalid registry filename",
+					"safe_to_use": "false",
+				})
+				return
+			}
 			actual, err := verifyFileHash(filePath, m.SHA256)
 			if err != nil {
 				w.Header().Set("Content-Type", "application/json")
@@ -801,8 +867,16 @@ func handleVerifyGGUFManifest(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			modelPath := filepath.Join(registryDir, m.Filename)
-			manifestFile := m.GGUFGuardManifest
+			modelPath, err := registryPath(m.Filename)
+			if err != nil {
+				http.Error(w, "invalid registry filename", http.StatusConflict)
+				return
+			}
+			manifestFile, err := registryPath(m.GGUFGuardManifest)
+			if err != nil {
+				http.Error(w, "invalid gguf-guard manifest path", http.StatusConflict)
+				return
+			}
 
 			out, err := runGGUFGuardVerify(ggufGuardBin, modelPath, manifestFile)
 			if err != nil {
@@ -882,7 +956,31 @@ func main() {
 	mux.HandleFunc("/v1/model/revoke", requireServiceToken(handleRevoke))
 
 	log.Printf("ai-model-registry listening on %s (auth_required=%v)", bind, !insecureDevMode || serviceToken != "")
-	if err := http.ListenAndServe(bind, mux); err != nil {
-		log.Fatalf("server error: %v", err)
+	server := &http.Server{
+		Addr:              bind,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("server error: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+	log.Println("shutting down ai-model-registry...")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("server shutdown error: %v", err)
+	}
+	log.Println("ai-model-registry stopped")
 }

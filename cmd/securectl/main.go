@@ -5,12 +5,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"text/tabwriter"
+	"time"
 )
 
 var registryURL = "http://127.0.0.1:8470"
+var apiClient = &http.Client{Timeout: 15 * time.Second}
 
 func init() {
 	if u := os.Getenv("REGISTRY_URL"); u != "" {
@@ -38,43 +41,61 @@ Artifact states:
   deleted       Soft-deleted, metadata retained for audit
 
 Environment:
-  REGISTRY_URL   Registry endpoint (default: http://127.0.0.1:8470)
+  REGISTRY_URL         Registry endpoint (default: http://127.0.0.1:8470)
+  SERVICE_TOKEN_PATH   Registry service token path (default: /run/secure-ai/service-token)
 `)
 	os.Exit(1)
 }
 
-func apiGet(path string) ([]byte, int, error) {
-	resp, err := http.Get(registryURL + path)
+func readServiceToken() string {
+	tokenPath := os.Getenv("SERVICE_TOKEN_PATH")
+	if tokenPath == "" {
+		tokenPath = "/run/secure-ai/service-token"
+	}
+	data, err := os.ReadFile(tokenPath)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+func apiRequest(method, path string, body io.Reader) ([]byte, int, error) {
+	req, err := http.NewRequest(method, registryURL+path, body)
+	if err != nil {
+		return nil, 0, err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if token := readServiceToken(); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := apiClient.Do(req)
 	if err != nil {
 		return nil, 0, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	return body, resp.StatusCode, nil
+	respBody, _ := io.ReadAll(resp.Body)
+	return respBody, resp.StatusCode, nil
+}
+
+func apiGet(path string) ([]byte, int, error) {
+	return apiRequest(http.MethodGet, path, nil)
 }
 
 func apiDelete(path string) ([]byte, int, error) {
-	req, err := http.NewRequest(http.MethodDelete, registryURL+path, nil)
-	if err != nil {
-		return nil, 0, err
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	return body, resp.StatusCode, nil
+	return apiRequest(http.MethodDelete, path, nil)
 }
 
 func apiPost(path string) ([]byte, int, error) {
-	resp, err := http.Post(registryURL+path, "application/json", strings.NewReader("{}"))
-	if err != nil {
-		return nil, 0, err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	return body, resp.StatusCode, nil
+	return apiRequest(http.MethodPost, path, strings.NewReader("{}"))
+}
+
+func modelQueryPath(endpoint, name string) string {
+	values := url.Values{}
+	values.Set("name", name)
+	return endpoint + "?" + values.Encode()
 }
 
 func cmdList() {
@@ -118,7 +139,7 @@ func cmdList() {
 }
 
 func cmdInfo(name string) {
-	data, code, err := apiGet("/v1/model?name=" + name)
+	data, code, err := apiGet(modelQueryPath("/v1/model", name))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -135,7 +156,7 @@ func cmdInfo(name string) {
 }
 
 func cmdVerify(name string) {
-	data, code, err := apiPost("/v1/model/verify?name=" + name)
+	data, code, err := apiPost(modelQueryPath("/v1/model/verify", name))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -159,7 +180,7 @@ func cmdVerify(name string) {
 }
 
 func cmdPath(name string) {
-	data, code, err := apiGet("/v1/model/path?name=" + name)
+	data, code, err := apiGet(modelQueryPath("/v1/model/path", name))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -178,7 +199,7 @@ func cmdPath(name string) {
 }
 
 func cmdRevoke(name string) {
-	data, code, err := apiPost("/v1/model/revoke?name=" + name)
+	data, code, err := apiPost(modelQueryPath("/v1/model/revoke", name))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -193,7 +214,7 @@ func cmdRevoke(name string) {
 }
 
 func cmdDelete(name string) {
-	data, code, err := apiDelete("/v1/model/delete?name=" + name)
+	data, code, err := apiDelete(modelQueryPath("/v1/model/delete", name))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -207,7 +228,7 @@ func cmdDelete(name string) {
 	if result["status"] == "already_deleted" {
 		fmt.Printf("Already deleted: %s\n", name)
 	} else {
-		fmt.Printf("Deleted (soft): %s — metadata retained for audit\n", name)
+		fmt.Printf("Deleted (soft): %s - metadata retained for audit\n", name)
 	}
 }
 
