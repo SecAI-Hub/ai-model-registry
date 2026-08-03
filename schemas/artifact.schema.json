@@ -4,7 +4,7 @@
   "title": "AI Model Registry Artifact",
   "description": "Schema for artifacts stored in the ai-model-registry manifest",
   "type": "object",
-  "required": ["name", "format", "filename", "sha256", "state"],
+  "required": ["name", "format", "filename", "sha256", "size_bytes", "state"],
   "properties": {
     "name": {
       "type": "string",
@@ -19,8 +19,14 @@
     },
     "filename": {
       "type": "string",
-      "description": "Filename on disk within the registry directory",
-      "minLength": 1
+      "description": "Quarantine input filename within the registry directory",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "object_path": {
+      "type": "string",
+      "description": "Immutable content-addressed runtime object path assigned at promotion",
+      "pattern": "^objects/sha256/[a-f0-9]{2}/[a-f0-9]{64}\\.(gguf|safetensors)$"
     },
     "sha256": {
       "type": "string",
@@ -34,7 +40,8 @@
     },
     "source": {
       "type": "string",
-      "description": "Origin URL or identifier (e.g. Hugging Face repo)"
+      "description": "Origin URL or identifier (e.g. Hugging Face repo)",
+      "maxLength": 4096
     },
     "promoted_at": {
       "type": "string",
@@ -44,26 +51,29 @@
     "state": {
       "type": "string",
       "description": "Trust state — only 'trusted' artifacts can be loaded at runtime",
-      "enum": ["trusted", "revoked"],
-      "default": "trusted"
+      "enum": ["acquired", "quarantined", "trusted", "revoked", "deleted"]
     },
     "scan_results": {
       "type": "object",
       "description": "Results from security scanners (e.g. modelscan, gguf-guard)",
-      "additionalProperties": { "type": "string" }
+      "maxProperties": 64,
+      "additionalProperties": { "type": "string", "maxLength": 1024 }
     },
     "scanner_versions": {
       "type": "object",
       "description": "Versions of scanners used during quarantine",
-      "additionalProperties": { "type": "string" }
+      "maxProperties": 64,
+      "additionalProperties": { "type": "string", "maxLength": 1024 }
     },
     "policy_version": {
       "type": "string",
-      "description": "Version of the promotion policy applied"
+      "description": "Version of the promotion policy applied",
+      "maxLength": 256
     },
     "source_revision": {
       "type": "string",
-      "description": "Source revision (e.g. Hugging Face commit hash)"
+      "description": "Source revision (e.g. Hugging Face commit hash)",
+      "maxLength": 256
     },
     "gguf_guard_fingerprint": {
       "type": "object",
@@ -71,7 +81,8 @@
     },
     "gguf_guard_manifest": {
       "type": "string",
-      "description": "Path to the gguf-guard integrity manifest file"
+      "description": "Relative path to the gguf-guard integrity manifest file",
+      "maxLength": 4096
     }
   },
   "additionalProperties": false

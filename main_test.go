@@ -96,12 +96,8 @@ func TestRegistryPathRejectsEscapes(t *testing.T) {
 	}
 
 	absolute := filepath.Join(tmp, "model.gguf")
-	resolved, err := registryPath(absolute)
-	if err != nil {
-		t.Fatalf("expected absolute registry path to be accepted: %v", err)
-	}
-	if resolved != absolute {
-		t.Fatalf("expected %q, got %q", absolute, resolved)
+	if resolved, err := registryPath(absolute); err == nil {
+		t.Fatalf("expected absolute registry path to be rejected, got %q", resolved)
 	}
 }
 
@@ -159,8 +155,9 @@ func TestDeleteSoftDelete(t *testing.T) {
 	manifestMu.Lock()
 	manifest = Manifest{Version: 1, Models: []Artifact{{
 		Name:     "delete-me",
+		Format:   "gguf",
 		Filename: "delete-me.gguf",
-		SHA256:   "abc123",
+		SHA256:   "0000000000000000000000000000000000000000000000000000000000000000",
 		State:    StateTrusted,
 	}}}
 	manifestMu.Unlock()
@@ -206,7 +203,7 @@ func TestDeleteAlreadyDeleted(t *testing.T) {
 	manifest = Manifest{Version: 1, Models: []Artifact{{
 		Name:     "already-gone",
 		Filename: "already-gone.gguf",
-		SHA256:   "abc123",
+		SHA256:   "0000000000000000000000000000000000000000000000000000000000000000",
 		State:    StateDeleted,
 	}}}
 	manifestMu.Unlock()
@@ -315,6 +312,39 @@ func TestVerifyAllDetectsTampered(t *testing.T) {
 	json.Unmarshal(w.Body.Bytes(), &body)
 	if body["status"] != "failed" {
 		t.Fatalf("expected failed, got %v", body["status"])
+	}
+}
+
+func TestVerifyAllSkipsDeletedArtifactWithExpectedMissingBytes(t *testing.T) {
+	tmp := t.TempDir()
+	registryDir = tmp
+
+	manifestMu.Lock()
+	manifest = Manifest{Version: 1, Models: []Artifact{{
+		Name:     "deleted",
+		Filename: "intentionally-absent.gguf",
+		SHA256:   "0000000000000000000000000000000000000000000000000000000000000000",
+		State:    StateDeleted,
+	}}}
+	manifestMu.Unlock()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/models/verify-all", nil)
+	w := httptest.NewRecorder()
+	handleVerifyAll(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected deleted absence to be non-failing, got %d: %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Status string              `json:"status"`
+		Models []map[string]string `json:"models"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Status != "ok" || len(body.Models) != 1 || body.Models[0]["status"] != "skipped" ||
+		body.Models[0]["state"] != string(StateDeleted) {
+		t.Fatalf("deleted artifact was not reported as expected absence: %#v", body)
 	}
 }
 
@@ -440,8 +470,9 @@ func TestRevokeModel(t *testing.T) {
 	manifestMu.Lock()
 	manifest = Manifest{Version: 1, Models: []Artifact{{
 		Name:     "revoke-me",
+		Format:   "gguf",
 		Filename: "revoke-me.gguf",
-		SHA256:   "abc123",
+		SHA256:   "0000000000000000000000000000000000000000000000000000000000000000",
 		State:    StateTrusted,
 	}}}
 	manifestMu.Unlock()
@@ -478,7 +509,7 @@ func TestRevokeAlreadyRevoked(t *testing.T) {
 	manifest = Manifest{Version: 1, Models: []Artifact{{
 		Name:     "already-revoked",
 		Filename: "already-revoked.gguf",
-		SHA256:   "abc123",
+		SHA256:   "0000000000000000000000000000000000000000000000000000000000000000",
 		State:    StateRevoked,
 	}}}
 	manifestMu.Unlock()
@@ -634,7 +665,7 @@ func TestAcquireArtifact(t *testing.T) {
 	body := `{
 		"name": "new-model",
 		"filename": "new-model.gguf",
-		"sha256": "abc123",
+		"sha256": "0000000000000000000000000000000000000000000000000000000000000000",
 		"size_bytes": 1024
 	}`
 
@@ -670,7 +701,7 @@ func TestAcquireMissingFields(t *testing.T) {
 }
 
 func TestAcquireDisallowedFormat(t *testing.T) {
-	body := `{"name":"bad","filename":"bad.pkl","sha256":"abc","size_bytes":10}`
+	body := `{"name":"bad","filename":"bad.pkl","sha256":"0000000000000000000000000000000000000000000000000000000000000000","size_bytes":10}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/model/acquire", strings.NewReader(body))
 	w := httptest.NewRecorder()
 	handleAcquire(w, req)
@@ -688,8 +719,9 @@ func TestQuarantineArtifact(t *testing.T) {
 	manifestMu.Lock()
 	manifest = Manifest{Version: 1, Models: []Artifact{{
 		Name:     "scan-me",
+		Format:   "gguf",
 		Filename: "scan-me.gguf",
-		SHA256:   "abc123",
+		SHA256:   "0000000000000000000000000000000000000000000000000000000000000000",
 		State:    StateAcquired,
 	}}}
 	manifestMu.Unlock()
@@ -725,7 +757,7 @@ func TestQuarantineAlreadyQuarantined(t *testing.T) {
 	manifest = Manifest{Version: 1, Models: []Artifact{{
 		Name:     "q-model",
 		Filename: "q-model.gguf",
-		SHA256:   "abc123",
+		SHA256:   "0000000000000000000000000000000000000000000000000000000000000000",
 		State:    StateQuarantined,
 	}}}
 	manifestMu.Unlock()
@@ -753,7 +785,7 @@ func TestQuarantineWrongState(t *testing.T) {
 	manifest = Manifest{Version: 1, Models: []Artifact{{
 		Name:     "trusted-model",
 		Filename: "trusted-model.gguf",
-		SHA256:   "abc123",
+		SHA256:   "0000000000000000000000000000000000000000000000000000000000000000",
 		State:    StateTrusted,
 	}}}
 	manifestMu.Unlock()
@@ -841,7 +873,7 @@ func TestFullLifecycleAcquireToDelete(t *testing.T) {
 	manifestMu.Unlock()
 
 	// Step 1: Acquire
-	acquireBody := `{"name":"lifecycle","filename":"lifecycle.gguf","sha256":"abc","size_bytes":100}`
+	acquireBody := `{"name":"lifecycle","filename":"lifecycle.gguf","sha256":"0000000000000000000000000000000000000000000000000000000000000000","size_bytes":100}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/model/acquire", strings.NewReader(acquireBody))
 	w := httptest.NewRecorder()
 	handleAcquire(w, req)
@@ -911,7 +943,7 @@ func TestFullLifecycleAcquireToDelete(t *testing.T) {
 	}
 }
 
-func TestHealthReportsStateCounts(t *testing.T) {
+func TestAuthenticatedStatsReportStateCounts(t *testing.T) {
 	manifestMu.Lock()
 	manifest = Manifest{Version: 1, Models: []Artifact{
 		{Name: "a", State: StateAcquired},
@@ -922,9 +954,9 @@ func TestHealthReportsStateCounts(t *testing.T) {
 	}}
 	manifestMu.Unlock()
 
-	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	req := httptest.NewRequest(http.MethodGet, "/v1/stats", nil)
 	w := httptest.NewRecorder()
-	handleHealth(w, req)
+	handleStats(w, req)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)

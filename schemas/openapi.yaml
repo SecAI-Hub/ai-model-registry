@@ -5,7 +5,7 @@ info:
   description: >
     Security-first AI artifact registry with digest-based storage,
     policy-gated promotion, explicit trust states, and fail-closed
-    authentication for mutating operations.
+    authentication for every non-health operation.
   license:
     name: Apache-2.0
     url: https://www.apache.org/licenses/LICENSE-2.0
@@ -14,9 +14,13 @@ servers:
   - url: http://127.0.0.1:8470
     description: Local (appliance mode)
 
+security:
+  - bearerAuth: []
+
 paths:
   /health:
     get:
+      security: []
       summary: Health check
       operationId: getHealth
       tags: [monitoring]
@@ -31,14 +35,6 @@ paths:
                   status:
                     type: string
                     example: "ok"
-                  model_count:
-                    type: integer
-                  trusted_count:
-                    type: integer
-                  registry_dir:
-                    type: string
-                  auth_required:
-                    type: boolean
 
   /v1/models:
     get:
@@ -54,6 +50,26 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/Artifact"
+
+  /v1/stats:
+    get:
+      summary: Return authenticated registry and lifecycle-state counts
+      operationId: getStats
+      tags: [monitoring]
+      responses:
+        "200":
+          description: Registry statistics
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [model_count, trusted_count, state_counts]
+                properties:
+                  model_count: {type: integer, minimum: 0}
+                  trusted_count: {type: integer, minimum: 0}
+                  state_counts:
+                    type: object
+                    additionalProperties: {type: integer, minimum: 0}
 
   /v1/model:
     get:
@@ -89,18 +105,31 @@ paths:
             type: string
       responses:
         "200":
-          description: Filesystem path
+          description: Digest-bound content-addressed runtime locator
           content:
             application/json:
               schema:
                 type: object
+                required: [path, sha256, size_bytes, storage_contract]
                 properties:
                   path:
                     type: string
+                  sha256:
+                    type: string
+                    pattern: "^[a-f0-9]{64}$"
+                  size_bytes:
+                    type: integer
+                    format: int64
+                    minimum: 0
+                  storage_contract:
+                    type: string
+                    const: content-addressed-v1
         "403":
           description: Artifact is not in trusted state
         "404":
           description: Model not found or file missing
+        "409":
+          description: Object is not content-addressed or failed digest verification
 
   /v1/model/verify:
     post:
@@ -132,7 +161,7 @@ paths:
       tags: [integrity]
       responses:
         "200":
-          description: All models verified
+          description: All present models verified; deleted artifacts are reported as skipped
           content:
             application/json:
               schema:
@@ -176,9 +205,53 @@ paths:
         "409":
           description: Manifest verification failed
 
+  /v1/model/acquire:
+    post:
+      summary: Register an untrusted artifact in acquired state
+      operationId: acquireModel
+      tags: [lifecycle]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AcquireRequest"
+      responses:
+        "201":
+          description: Artifact acquired
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Artifact"
+        "400":
+          description: Invalid request
+        "403":
+          description: Format not allowed
+        "409":
+          description: Artifact name or active filename already exists
+
+  /v1/model/quarantine:
+    post:
+      summary: Move an acquired artifact to quarantined state
+      operationId: quarantineModel
+      tags: [lifecycle]
+      parameters:
+        - name: name
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Artifact quarantined
+        "404":
+          description: Model not found
+        "409":
+          description: Invalid lifecycle transition
+
   /v1/model/promote:
     post:
-      summary: Promote artifact to trusted state
+      summary: Promote a matching quarantined artifact to trusted state
       operationId: promoteModel
       tags: [lifecycle]
       security:
@@ -201,7 +274,24 @@ paths:
         "403":
           description: Auth required or format not allowed
         "409":
-          description: Hash verification failed
+          description: Hash verification failed or the quarantined artifact does not match
+        "422":
+          description: Required policy or scanner evidence is absent or failed
+
+  /v1/audit:
+    get:
+      summary: List hash-chained lifecycle audit events
+      operationId: listAuditEvents
+      tags: [audit]
+      responses:
+        "200":
+          description: Ordered lifecycle event chain
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/AuditEvent"
 
   /v1/model/revoke:
     post:
@@ -265,7 +355,7 @@ components:
   schemas:
     Artifact:
       type: object
-      required: [name, format, filename, sha256, state]
+      required: [name, format, filename, sha256, size_bytes, state]
       properties:
         name:
           type: string
@@ -274,20 +364,26 @@ components:
           enum: [gguf, safetensors]
         filename:
           type: string
+          maxLength: 4096
+        object_path:
+          type: string
+          pattern: "^objects/sha256/[a-f0-9]{2}/[a-f0-9]{64}\\.(gguf|safetensors)$"
         sha256:
           type: string
           pattern: "^[a-f0-9]{64}$"
         size_bytes:
           type: integer
           format: int64
+          minimum: 0
         source:
           type: string
+          maxLength: 4096
         promoted_at:
           type: string
           format: date-time
         state:
           type: string
-          enum: [trusted, revoked]
+          enum: [acquired, quarantined, trusted, revoked, deleted]
           description: Trust state — only trusted artifacts can be loaded at runtime
         scan_results:
           type: object
@@ -299,27 +395,62 @@ components:
             type: string
         policy_version:
           type: string
+          maxLength: 256
         source_revision:
           type: string
+          maxLength: 256
         gguf_guard_fingerprint:
           type: object
         gguf_guard_manifest:
           type: string
+          maxLength: 4096
+
+    AcquireRequest:
+      type: object
+      required: [name, filename, sha256, size_bytes]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        filename:
+          type: string
+          minLength: 1
+          maxLength: 4096
+        sha256:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+        size_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+        source:
+          type: string
+          maxLength: 4096
 
     PromoteRequest:
       type: object
+      additionalProperties: false
       required: [name, filename, sha256]
       properties:
         name:
           type: string
+          minLength: 1
+          maxLength: 256
         filename:
           type: string
+          minLength: 1
+          maxLength: 4096
         sha256:
           type: string
+          pattern: "^[a-f0-9]{64}$"
         size_bytes:
           type: integer
+          minimum: 0
         source:
           type: string
+          maxLength: 4096
         scan_results:
           type: object
           additionalProperties:
@@ -330,12 +461,49 @@ components:
             type: string
         policy_version:
           type: string
+          maxLength: 256
         source_revision:
           type: string
+          maxLength: 256
         gguf_guard_fingerprint:
           type: object
         gguf_guard_manifest:
           type: string
+          maxLength: 4096
+
+    AuditEvent:
+      type: object
+      required: [sequence, timestamp, action, name, to_state, sha256, artifact, prev_hash, hash]
+      additionalProperties: false
+      properties:
+        sequence:
+          type: integer
+          format: int64
+          minimum: 1
+        timestamp:
+          type: string
+          format: date-time
+        action:
+          type: string
+          enum: [bootstrap, acquire, quarantine, promote, revoke, delete]
+        name:
+          type: string
+        from_state:
+          type: string
+          enum: [acquired, quarantined, trusted, revoked, deleted]
+        to_state:
+          type: string
+          enum: [acquired, quarantined, trusted, revoked, deleted]
+        sha256:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+        artifact:
+          $ref: "#/components/schemas/Artifact"
+        prev_hash:
+          type: string
+        hash:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
 
     VerifyResult:
       type: object
@@ -368,7 +536,15 @@ components:
                 type: string
               status:
                 type: string
+                enum: [verified, failed, skipped]
               sha256:
+                type: string
+              state:
+                type: string
+              reason:
+                type: string
+              error:
                 type: string
         checked:
           type: integer
+          description: Number of registry records reported, including deleted records skipped as expected absence

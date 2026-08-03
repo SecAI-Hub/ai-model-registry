@@ -1,0 +1,11 @@
+.git
+.local
+dist
+coverage.out
+registry
+securectl
+*.key
+*.pem
+*.jsonl
+service-token
+*.token

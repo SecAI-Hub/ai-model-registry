@@ -8,7 +8,8 @@ A lightweight HTTP service that manages the lifecycle of AI artifacts with a str
 - Default-deny: artifacts must be explicitly promoted before runtime use
 - Explicit states: acquired, quarantined, trusted, revoked, deleted (with audit trail)
 - Fail-closed auth: mutations blocked without service token
-- Digest-based: SHA-256 verification on every operation
+- Content-addressed: promotion snapshots verified bytes to a no-replace SHA-256 path
+- Replayable: complete event snapshots must reconstruct registry state exactly
 - Immutable boot fallback via models.lock.yaml
 
 ## API endpoints
@@ -16,7 +17,7 @@ A lightweight HTTP service that manages the lifecycle of AI artifacts with a str
 - GET /health — health check
 - GET /v1/models — list all artifacts
 - GET /v1/model?name=X — get artifact details
-- GET /v1/model/path?name=X — get filesystem path (trusted only)
+- GET /v1/model/path?name=X — get path+digest+size runtime contract (trusted only)
 - POST /v1/model/verify?name=X — verify artifact hash
 - POST /v1/models/verify-all — batch integrity verification
 - GET /v1/integrity/status — last integrity check result
@@ -30,10 +31,11 @@ A lightweight HTTP service that manages the lifecycle of AI artifacts with a str
 ## Key design decisions
 
 - Only gguf and safetensors formats allowed (pickle blocked by design)
-- /v1/model/path blocks revoked artifacts with 403
+- /v1/model/path blocks revoked artifacts and requires content-addressed storage
+- Runtime consumers must verify the returned SHA-256 and size on the opened file
 - Service token uses constant-time comparison
 - No database — manifest.json + models.lock.yaml only
-- Single Go binary, zero external dependencies beyond yaml.v3
+- Registry and pinned gguf-guard static binaries in the production image
 - Appliance mode: 127.0.0.1 only, strict auth, baked-in fallback
 - Standalone mode: same secure defaults, broader configuration options
 

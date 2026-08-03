@@ -6,19 +6,79 @@ on:
       - "v*"
 
 permissions:
-  contents: write
-  packages: write
-  id-token: write
-  attestations: write
+  contents: read
 
 jobs:
+  verify-release-commit:
+    name: Verify Tagged Commit Gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Test release tag gate
+        run: |
+          ./scripts/test-verify-release-tag.sh
+          ./scripts/test-derive-oci-tags.sh
+      - name: Verify annotated SemVer tag target is on origin/main
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: ./scripts/verify-release-tag.sh "${RELEASE_TAG}" "${RELEASE_SHA}"
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: "1.26.5"
+          cache-dependency-path: go.sum
+      - name: Build, race test, vet, and verify format
+        run: |
+          go mod verify
+          CGO_ENABLED=0 go build -trimpath ./...
+          go test -race -count=1 ./...
+          go vet ./...
+          test -z "$(gofmt -s -l .)"
+      - name: Vulnerability check
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.3.0
+          govulncheck ./...
+      - name: Security static analysis
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0
+          gosec -severity medium -confidence medium ./...
+      - name: Validate workflows and shell scripts
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/repo:ro" -w /repo \
+            rhysd/actionlint:1.7.7@sha256:887a259a5a534f3c4f36cb02dca341673c6089431057242cdc931e9f133147e9
+          docker run --rm --entrypoint shellcheck -v "$GITHUB_WORKSPACE:/repo:ro" -w /repo \
+            rhysd/actionlint:1.7.7@sha256:887a259a5a534f3c4f36cb02dca341673c6089431057242cdc931e9f133147e9 \
+            -x scripts/*.sh
+      - name: Scan secrets in worktree and history
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/repo:ro" -w /repo \
+            ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
+            dir . --redact --no-banner --no-color
+          docker run --rm -v "$GITHUB_WORKSPACE:/repo:ro" -w /repo \
+            ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
+            git . --redact --no-banner --no-color
+      - name: Build and scan release container
+        run: |
+          docker build --pull -f Containerfile -t ai-model-registry:release-gate .
+          docker run --rm -v "$GITHUB_WORKSPACE:/src:ro" \
+            aquasec/trivy:0.70.0@sha256:be1190afcb28352bfddc4ddeb71470835d16462af68d310f9f4bca710961a41e \
+            fs --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --exit-code 1 /src
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.70.0@sha256:be1190afcb28352bfddc4ddeb71470835d16462af68d310f9f4bca710961a41e \
+            image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 ai-model-registry:release-gate
+
   build-binaries:
     name: Build Binaries
+    needs: verify-release-commit
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      id-token: write
-      attestations: write
+      contents: read
     strategy:
       matrix:
         include:
@@ -27,21 +87,39 @@ jobs:
           - goos: linux
             goarch: arm64
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          go-version: "1.23"
+          persist-credentials: false
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: "1.26.5"
           cache-dependency-path: go.sum
 
-      - name: Build registry binary
+      - name: Build pinned gguf-guard and registry binaries
         env:
           CGO_ENABLED: "0"
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
+          . ./build/gguf-guard.lock
+          GUARD_SOURCE="${RUNNER_TEMP}/gguf-guard"
+          GUARD_ARCHIVE="${RUNNER_TEMP}/gguf-guard.tar.gz"
+          mkdir -p "${GUARD_SOURCE}"
+          curl --fail --silent --show-error --location \
+            --output "${GUARD_ARCHIVE}" \
+            "${GGUF_GUARD_REPOSITORY}/archive/${GGUF_GUARD_COMMIT}.tar.gz"
+          echo "${GGUF_GUARD_ARCHIVE_SHA256}  ${GUARD_ARCHIVE}" | sha256sum -c -
+          tar -xzf "${GUARD_ARCHIVE}" --strip-components=1 -C "${GUARD_SOURCE}"
+          GUARD_BINARY="gguf-guard-${{ matrix.goos }}-${{ matrix.goarch }}"
+          (cd "${GUARD_SOURCE}" && go mod download && \
+            go build -trimpath -ldflags="-s -w" -o "${GITHUB_WORKSPACE}/${GUARD_BINARY}" ./cmd/gguf-guard/)
+          GUARD_BINARY_SHA256="$(sha256sum "${GUARD_BINARY}" | awk '{print $1}')"
           BINARY_NAME="ai-model-registry-${{ matrix.goos }}-${{ matrix.goarch }}"
-          go build -ldflags="-s -w -X main.version=${{ github.ref_name }}" -o "${BINARY_NAME}" .
+          go build -trimpath \
+            -ldflags="-s -w -X main.version=${{ github.ref_name }} -X main.ggufGuardSHA256=${GUARD_BINARY_SHA256}" \
+            -o "${BINARY_NAME}" .
           sha256sum "${BINARY_NAME}" > "${BINARY_NAME}.sha256"
+          sha256sum "${GUARD_BINARY}" > "${GUARD_BINARY}.sha256"
 
       - name: Build securectl binary
         env:
@@ -54,34 +132,38 @@ jobs:
           sha256sum "${BINARY_NAME}" > "${BINARY_NAME}.sha256"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
             ai-model-registry-${{ matrix.goos }}-${{ matrix.goarch }}
             ai-model-registry-${{ matrix.goos }}-${{ matrix.goarch }}.sha256
+            gguf-guard-${{ matrix.goos }}-${{ matrix.goarch }}
+            gguf-guard-${{ matrix.goos }}-${{ matrix.goarch }}.sha256
             securectl-${{ matrix.goos }}-${{ matrix.goarch }}
             securectl-${{ matrix.goos }}-${{ matrix.goarch }}.sha256
 
   release:
     name: Create Release
-    needs: build-binaries
+    needs: [verify-release-commit, build-binaries]
     runs-on: ubuntu-latest
     permissions:
       contents: write
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Download all artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           merge-multiple: true
           path: dist/
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@3454372be43a1bf12a3d0be3db81e77225c69aab # v3.8.2
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Sign binaries with cosign (keyless)
         run: |
@@ -92,12 +174,12 @@ jobs:
           done
 
       - name: Generate SLSA provenance attestation
-        uses: actions/attest-build-provenance@db473fddc028af60658334401dc6fa3ffd8669fd # v2.3.0
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
           subject-path: "dist/*"
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           generate_release_notes: true
           files: |
@@ -107,7 +189,7 @@ jobs:
 
   container:
     name: Build & Push Container
-    needs: build-binaries
+    needs: [verify-release-commit, build-binaries]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -117,7 +199,9 @@ jobs:
       REGISTRY: ghcr.io
       IMAGE_NAME: ${{ github.repository }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Log in to GHCR
         uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
@@ -126,15 +210,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Derive collision-free immutable OCI tags
+        id: oci_tags
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: ./scripts/derive-oci-tags.sh "${REGISTRY}/${IMAGE_NAME}" "${RELEASE_TAG}" "${RELEASE_SHA}" >> "${GITHUB_OUTPUT}"
+
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@902fa8ec7d6ecbf8d84d538b9b233a880e428804 # v5.7.0
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ steps.oci_tags.outputs.repository }}
+          flavor: latest=false
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha
+            type=raw,value=${{ steps.oci_tags.outputs.version }}
+            type=raw,value=${{ steps.oci_tags.outputs.sha }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
@@ -154,8 +245,8 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@3454372be43a1bf12a3d0be3db81e77225c69aab # v3.8.2
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Sign container image with cosign (keyless)
         run: |
-          cosign sign --yes ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+          cosign sign --yes ${{ steps.oci_tags.outputs.repository }}@${{ steps.push.outputs.digest }}

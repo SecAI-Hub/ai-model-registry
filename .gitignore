@@ -25,3 +25,21 @@ manifest.json
 *.gguf
 *.safetensors
 *.jsonl
+
+# Local secrets and credentials
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.token
+service-token
+secrets/
+credentials/
+
+# Local runtime database state
+*.db
+*.sqlite
+*.sqlite3

@@ -49,9 +49,12 @@ acquired ──▶ quarantined ──▶ trusted ──▶ revoked
 **Severity:** Critical
 
 **Mitigations:**
-- Fail-closed authentication: all mutating operations require a service token
+- Fail-closed authentication: every endpoint except `/health` requires a service token
 - SHA-256 verification on promote: hash must match what was scanned
 - State transition enforcement: only `quarantined` artifacts can be promoted to `trusted`
+- Promotion snapshots bytes into a no-replace, digest-derived object path
+- Runtime resolution returns path, digest, size, and storage-contract version; the
+  consumer must verify the opened file before parsing
 - Deleted artifacts cannot be re-promoted
 
 ### T2: Hash collision / substitution
@@ -67,6 +70,9 @@ acquired ──▶ quarantined ──▶ trusted ──▶ revoked
 
 **Mitigations:**
 - SHA-256 provides 128-bit collision resistance (no known practical attacks)
+- Descriptor-relative source reads, pre/post identity checks, and no-replace
+  content-addressed publication close the admission path-replacement window
+- `/v1/model/path` re-verifies the immutable object and returns its digest contract
 - Periodic integrity checks via systemd timer re-verify all artifacts
 - Filesystem permissions restrict write access to the registry directory
 - Systemd sandboxing (ProtectSystem=strict) limits filesystem access
@@ -86,8 +92,8 @@ acquired ──▶ quarantined ──▶ trusted ──▶ revoked
 - Token loaded from file (not environment variable)
 - Constant-time comparison prevents timing attacks
 - Localhost-only bind prevents network sniffing
-- Token file should be root-owned with mode 0400
-- Systemd `LoadCredential` can inject the token without filesystem exposure
+- Credential source should be root-owned with mode 0400
+- Systemd `LoadCredential` injects a private read-only copy readable by `DynamicUser`
 
 ### T4: Denial of service
 
@@ -101,7 +107,7 @@ acquired ──▶ quarantined ──▶ trusted ──▶ revoked
 **Severity:** Medium
 
 **Mitigations:**
-- Authentication required for all mutating endpoints (limits attack surface to token holders)
+- Authentication required for every endpoint except `/health` (limits attack surface to token holders)
 - Systemd resource limits: 512M memory, 50% CPU, 64 tasks
 - Registry directory quotas can be enforced at the filesystem level
 
@@ -117,7 +123,11 @@ acquired ──▶ quarantined ──▶ trusted ──▶ revoked
 
 **Mitigations:**
 - `sync.RWMutex` serializes all manifest reads and writes
-- Atomic file writes (write to temp file, then rename)
+- Strict parsing rejects unknown fields, trailing JSON, invalid states, duplicate names,
+  and malformed event chains; full event replay must reconstruct every artifact and
+  metadata field exactly
+- State changes and hash-chained audit events are persisted together using a synced
+  temporary file, atomic rename, and parent-directory sync
 - Systemd sandboxing limits filesystem access to the registry directory only
 - Periodic integrity checks detect hash mismatches caused by manifest tampering
 
@@ -125,8 +135,10 @@ acquired ──▶ quarantined ──▶ trusted ──▶ revoked
 
 | Risk | Severity | Notes |
 |---|---|---|
-| TOCTOU between scan and promote | Medium | File could be modified between quarantine scan and promotion. Mitigated by hash verification on promote, but a very narrow race window exists. |
+| External scanner trust | High | The registry validates declared evidence and hashes, but does not itself run scanners or independently attest their identity. Use separate scanner/operator credentials at the deployment boundary and signed evidence for higher assurance. |
+| Verifier output memory | Medium | The fixed GGUF verifier is time-bounded and its returned output is truncated, but its child-process output is buffered in memory. Run it under the supplied service resource limits. |
 | No encryption at rest | Low | Artifacts are stored in plaintext. Acceptable for appliance mode with full-disk encryption. For standalone deployments, use filesystem-level encryption. |
 | Single-instance manifest | Low | Manifest is a single JSON file. Not suitable for distributed deployments without external coordination. Acceptable for single-appliance use. |
-| No audit log chaining | Medium | The registry logs mutations but does not use a hash-chained audit log. The quarantine pipeline provides chained logging for the full admission flow. |
+| Single shared credential | Medium | The service has no built-in roles, tenant isolation, or mTLS. Keep it on loopback or place it behind a trusted identity-aware proxy. |
 | Soft-delete metadata retention | Low | Deleted artifact metadata is retained indefinitely. Operators may need to implement external cleanup for compliance. |
+| Event-log rollback | Medium | Signed local checkpoints bind exact manifest bytes to replayed event heads, and recovery can require a separately retained prior head. The deployment must still place checkpoints/heads in independently controlled immutable storage because local signatures alone do not prove freshness. |

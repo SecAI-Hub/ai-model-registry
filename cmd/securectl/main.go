@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -13,7 +14,12 @@ import (
 )
 
 var registryURL = "http://127.0.0.1:8470"
-var apiClient = &http.Client{Timeout: 15 * time.Second}
+var apiClient = &http.Client{
+	Timeout: 15 * time.Second,
+	CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
 
 func init() {
 	if u := os.Getenv("REGISTRY_URL"); u != "" {
@@ -28,7 +34,7 @@ Usage:
   securectl list                     List all models (all states)
   securectl info <name>              Show details for a model
   securectl verify <name>            Verify a model's hash against manifest
-  securectl path <name>              Print the filesystem path of a model
+  securectl path <name>              Print the digest-bound runtime locator as JSON
   securectl revoke <name>            Revoke a model (mark as untrusted)
   securectl delete <name>            Soft-delete a model (metadata retained)
   securectl status                   Show registry service health
@@ -47,19 +53,56 @@ Environment:
 	os.Exit(1)
 }
 
-func readServiceToken() string {
+func readServiceToken() (string, error) {
 	tokenPath := os.Getenv("SERVICE_TOKEN_PATH")
 	if tokenPath == "" {
 		tokenPath = "/run/secure-ai/service-token"
 	}
-	data, err := os.ReadFile(tokenPath)
+	// #nosec G703 -- administrator-selected credential path; strict link, mode, size, and identity checks follow.
+	before, err := os.Lstat(tokenPath)
 	if err != nil {
-		return ""
+		return "", err
 	}
-	return strings.TrimSpace(string(data))
+	if before.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("service token symbolic links are not allowed")
+	}
+	if before.Mode().Perm()&0o077 != 0 {
+		return "", fmt.Errorf("service token must not be accessible by group or other users")
+	}
+	// #nosec G304,G703 -- validated credential path with opened-file and post-open identity checks.
+	f, err := os.Open(tokenPath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	opened, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	// #nosec G703 -- paired with pre/opened identity checks above.
+	after, err := os.Lstat(tokenPath)
+	if err != nil || after.Mode()&os.ModeSymlink != 0 ||
+		!os.SameFile(before, opened) || !os.SameFile(opened, after) {
+		return "", fmt.Errorf("service token changed while opening or is a symbolic link")
+	}
+	if !opened.Mode().IsRegular() || opened.Size() > 4096 {
+		return "", fmt.Errorf("service token must be a regular file no larger than 4096 bytes")
+	}
+	data, err := io.ReadAll(io.LimitReader(f, 4097))
+	if err != nil || len(data) > 4096 {
+		return "", fmt.Errorf("read service token: invalid token file")
+	}
+	token := strings.TrimSpace(string(data))
+	if len(token) < 32 || strings.ContainsAny(token, " \t\r\n") {
+		return "", fmt.Errorf("service token must be at least 32 bytes without whitespace")
+	}
+	return token, nil
 }
 
 func apiRequest(method, path string, body io.Reader) ([]byte, int, error) {
+	if err := validateRegistryURL(registryURL); err != nil {
+		return nil, 0, err
+	}
 	req, err := http.NewRequest(method, registryURL+path, body)
 	if err != nil {
 		return nil, 0, err
@@ -67,7 +110,11 @@ func apiRequest(method, path string, body io.Reader) ([]byte, int, error) {
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	if token := readServiceToken(); token != "" {
+	if path != "/health" {
+		token, err := readServiceToken()
+		if err != nil {
+			return nil, 0, fmt.Errorf("service authentication unavailable: %w", err)
+		}
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
@@ -76,8 +123,35 @@ func apiRequest(method, path string, body io.Reader) ([]byte, int, error) {
 		return nil, 0, err
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20+1))
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(respBody) > 1<<20 {
+		return nil, 0, fmt.Errorf("registry response exceeds 1 MiB")
+	}
 	return respBody, resp.StatusCode, nil
+}
+
+func validateRegistryURL(raw string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("invalid registry URL")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("registry URL must use http or https")
+	}
+	if parsed.Scheme == "http" {
+		host := parsed.Hostname()
+		loopback := host == "localhost"
+		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+			loopback = true
+		}
+		if !loopback {
+			return fmt.Errorf("plaintext registry URL must use a loopback address")
+		}
+	}
+	return nil
 }
 
 func apiGet(path string) ([]byte, int, error) {
@@ -193,9 +267,19 @@ func cmdPath(name string) {
 		fmt.Fprintf(os.Stderr, "model %q not found\n", name)
 		os.Exit(1)
 	}
-	var result map[string]string
-	json.Unmarshal(data, &result)
-	fmt.Println(result["path"])
+	var result struct {
+		Path            string `json:"path"`
+		SHA256          string `json:"sha256"`
+		SizeBytes       int64  `json:"size_bytes"`
+		StorageContract string `json:"storage_contract"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil || result.Path == "" ||
+		result.SHA256 == "" || result.StorageContract != "content-addressed-v1" {
+		fmt.Fprintln(os.Stderr, "error: registry returned an incomplete runtime locator")
+		os.Exit(1)
+	}
+	encoded, _ := json.Marshal(result)
+	fmt.Println(string(encoded))
 }
 
 func cmdRevoke(name string) {

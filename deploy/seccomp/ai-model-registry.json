@@ -1,5 +1,5 @@
 {
-  "_comment": "Seccomp profile for ai-model-registry (Go binary). Localhost network, file I/O, no exec, no raw device access.",
+  "_comment": "Seccomp profile for ai-model-registry (Go binary). Localhost network, file I/O, verifier/OCI exec, and no raw device access.",
   "defaultAction": "SCMP_ACT_ERRNO",
   "defaultErrnoRet": 1,
   "archMap": [
@@ -15,10 +15,11 @@
         "rt_sigaction", "rt_sigprocmask", "rt_sigreturn",
         "pread64", "pwrite64", "readv", "writev",
         "access", "pipe", "pipe2", "dup", "dup2", "dup3",
-        "getpid", "getuid", "getgid", "geteuid", "getegid",
+        "getpid", "getuid", "getgid", "geteuid", "getegid", "capget", "capset",
+        "setuid", "setgid", "setgroups", "setresuid", "setresgid",
         "getppid", "gettid", "getdents64",
         "clone", "clone3", "wait4",
-        "exit", "exit_group",
+        "exit", "exit_group", "execve", "execveat",
         "futex", "futex_waitv",
         "set_robust_list", "get_robust_list",
         "nanosleep", "clock_nanosleep", "clock_gettime", "clock_getres",
@@ -36,12 +37,13 @@
         "open", "openat", "openat2", "fcntl",
         "fadvise64", "fallocate",
         "rename", "renameat", "renameat2",
+        "link", "linkat",
         "unlink", "unlinkat",
         "mkdir", "mkdirat",
         "ftruncate", "fsync", "fdatasync",
         "readlink", "readlinkat",
         "statx", "statfs", "fstatfs",
-        "getcwd", "umask", "fchmod", "fchmodat",
+        "getcwd", "chdir", "fchdir", "umask", "fchmod", "fchmodat",
         "fchown", "fchownat"
       ],
       "action": "SCMP_ACT_ALLOW"

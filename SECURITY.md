@@ -39,7 +39,7 @@ If you discover a security issue, please email **security@secai-hub.dev** with:
 
 This service enforces a default-deny trust model for AI artifacts:
 
-- All mutating operations require bearer token authentication (fail-closed)
+- Every endpoint except `/health` requires bearer token authentication (fail-closed)
 - Artifacts must pass through a policy-gated promotion pipeline
 - Runtime consumption is restricted to `trusted` state artifacts only
 - SHA-256 digest verification on every promote, verify, and integrity check
@@ -61,8 +61,18 @@ boundaries, threats, mitigations, and residual risks.
 The following hardening measures are applied by default:
 
 - **Localhost binding:** `127.0.0.1:8470` — no network exposure
-- **Fail-closed auth:** mutations rejected without valid service token
+- **Fail-closed auth:** startup fails without a valid service-token file, and every
+  non-health request requires it. `INSECURE_DEV_MODE=true` is an explicit local-only escape hatch.
 - **Format allowlist:** only `gguf` and `safetensors` accepted (pickle blocked)
-- **systemd sandboxing:** DynamicUser, ProtectSystem=strict, PrivateNetwork, seccomp
-- **No external dependencies at runtime:** single static binary
+- **systemd sandboxing:** DynamicUser, ProtectSystem=strict, restricted address
+  families, system-call filtering, and resource limits
+- **Private systemd credential mount:** `LoadCredential=` supplies the service token
+  to `DynamicUser` without a shared `/run` file
+- **Pinned GGUF verifier:** the final container includes a commit/archive-digest-pinned
+  static `gguf-guard`; registry startup verifies its embedded binary digest
+- **Content-addressed runtime storage:** promoted bytes are published to immutable
+  digest paths, and consumers receive a path+digest+size contract
+- **Signed audit checkpoints:** offline manifest exports are Ed25519-signed,
+  payload-digested, fully replayed, and no-overwrite; recovery requires a
+  separately retained prior head and writes only to a new path
 - **No telemetry or phone-home:** all data stays on the local machine
