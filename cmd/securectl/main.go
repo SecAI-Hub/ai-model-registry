@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -48,13 +50,17 @@ Artifact states:
 
 Environment:
   REGISTRY_URL         Registry endpoint (default: http://127.0.0.1:8470)
-  SERVICE_TOKEN_PATH   Registry service token path (default: /run/secure-ai/service-token)
+  REGISTRY_ADMIN_TOKEN_PATH  Administrator credential for scoped deployments
+  SERVICE_TOKEN_PATH         Legacy all-service credential (default: /run/secure-ai/service-token)
 `)
 	os.Exit(1)
 }
 
 func readServiceToken() (string, error) {
-	tokenPath := os.Getenv("SERVICE_TOKEN_PATH")
+	tokenPath := os.Getenv("REGISTRY_ADMIN_TOKEN_PATH")
+	if tokenPath == "" {
+		tokenPath = os.Getenv("SERVICE_TOKEN_PATH")
+	}
 	if tokenPath == "" {
 		tokenPath = "/run/secure-ai/service-token"
 	}
@@ -236,19 +242,22 @@ func cmdVerify(name string) {
 		os.Exit(1)
 	}
 
-	var result map[string]string
-	json.Unmarshal(data, &result)
+	result, decodeErr := decodeVerificationResponse(data, code)
+	if decodeErr != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", decodeErr)
+		os.Exit(1)
+	}
 
 	if code == 200 {
-		fmt.Printf("VERIFIED: %s (sha256=%s, state=%s)\n", name, result["sha256"], result["state"])
-		if result["safe_to_use"] == "false" {
-			fmt.Printf("  WARNING: model is not safe to use (state=%s)\n", result["state"])
+		fmt.Printf("VERIFIED: %s (sha256=%s, state=%s)\n", name, result.SHA256, result.State)
+		if result.SafeToUse == "false" {
+			fmt.Printf("  WARNING: model is not safe to use (state=%s)\n", result.State)
 			os.Exit(1)
 		}
 	} else {
 		fmt.Printf("FAILED: %s\n", name)
-		fmt.Printf("  expected: %s\n", result["expected"])
-		fmt.Printf("  actual:   %s\n", result["actual"])
+		fmt.Printf("  expected: %s\n", result.Expected)
+		fmt.Printf("  actual:   %s\n", result.Actual)
 		os.Exit(1)
 	}
 }
@@ -267,19 +276,65 @@ func cmdPath(name string) {
 		fmt.Fprintf(os.Stderr, "model %q not found\n", name)
 		os.Exit(1)
 	}
-	var result struct {
-		Path            string `json:"path"`
-		SHA256          string `json:"sha256"`
-		SizeBytes       int64  `json:"size_bytes"`
-		StorageContract string `json:"storage_contract"`
-	}
-	if err := json.Unmarshal(data, &result); err != nil || result.Path == "" ||
-		result.SHA256 == "" || result.StorageContract != "content-addressed-v1" {
-		fmt.Fprintln(os.Stderr, "error: registry returned an incomplete runtime locator")
+	result, err := decodePathResponse(data, code)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 	encoded, _ := json.Marshal(result)
 	fmt.Println(string(encoded))
+}
+
+var digestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+type verificationResponse struct {
+	SchemaVersion int    `json:"schema_version,omitempty"`
+	Status        string `json:"status"`
+	SHA256        string `json:"sha256"`
+	State         string `json:"state"`
+	SafeToUse     string `json:"safe_to_use"`
+	Expected      string `json:"expected"`
+	Actual        string `json:"actual"`
+}
+
+func decodeVerificationResponse(data []byte, code int) (verificationResponse, error) {
+	var result verificationResponse
+	if err := json.Unmarshal(data, &result); err != nil {
+		return result, fmt.Errorf("invalid verification response")
+	}
+	if code == http.StatusOK && ((result.SchemaVersion != 0 && result.SchemaVersion != 1) ||
+		result.Status != "verified" || !digestPattern.MatchString(result.SHA256) ||
+		(result.SafeToUse != "true" && result.SafeToUse != "false")) {
+		return result, fmt.Errorf("incomplete verification response")
+	}
+	return result, nil
+}
+
+type pathResponse struct {
+	SchemaVersion   int    `json:"schema_version,omitempty"`
+	Status          string `json:"status,omitempty"`
+	SafeToUse       string `json:"safe_to_use,omitempty"`
+	Name            string `json:"name,omitempty"`
+	Filename        string `json:"filename,omitempty"`
+	Format          string `json:"format,omitempty"`
+	Path            string `json:"path"`
+	SHA256          string `json:"sha256"`
+	SizeBytes       int64  `json:"size_bytes"`
+	StorageContract string `json:"storage_contract"`
+}
+
+func decodePathResponse(data []byte, code int) (pathResponse, error) {
+	var result pathResponse
+	if code != http.StatusOK {
+		return result, fmt.Errorf("path verification unavailable (HTTP %d)", code)
+	}
+	if err := json.Unmarshal(data, &result); err != nil || !filepath.IsAbs(result.Path) || strings.ContainsAny(result.Path, "\x00\r\n") ||
+		!digestPattern.MatchString(result.SHA256) || result.SizeBytes < 0 || result.StorageContract != "content-addressed-v1" ||
+		(result.SchemaVersion != 0 && result.SchemaVersion != 1) ||
+		(result.SchemaVersion == 1 && (result.Status != "verified" || result.SafeToUse != "true" || result.Name == "" || result.Filename == "" || result.Format == "")) {
+		return result, fmt.Errorf("registry returned an incomplete runtime locator")
+	}
+	return result, nil
 }
 
 func cmdRevoke(name string) {

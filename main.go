@@ -66,8 +66,9 @@ type Artifact struct {
 	PolicyVersion   string            `json:"policy_version,omitempty" yaml:"policy_version,omitempty"`
 	SourceRevision  string            `json:"source_revision,omitempty" yaml:"source_revision,omitempty"`
 	// gguf-guard integrity data (GGUF files only)
-	GGUFGuardFingerprint map[string]any `json:"gguf_guard_fingerprint,omitempty" yaml:"gguf_guard_fingerprint,omitempty"`
-	GGUFGuardManifest    string         `json:"gguf_guard_manifest,omitempty" yaml:"gguf_guard_manifest,omitempty"`
+	GGUFGuardFingerprint map[string]any   `json:"gguf_guard_fingerprint,omitempty" yaml:"gguf_guard_fingerprint,omitempty"`
+	GGUFGuardManifest    string           `json:"gguf_guard_manifest,omitempty" yaml:"gguf_guard_manifest,omitempty"`
+	Admission            *AdmissionRecord `json:"admission,omitempty" yaml:"admission,omitempty"`
 }
 
 // Manifest is the runtime registry manifest (stored as JSON).
@@ -124,6 +125,8 @@ var (
 	// P0: fail-closed auth — mutations are blocked when no token is configured
 	// unless INSECURE_DEV_MODE=true is explicitly set.
 	insecureDevMode bool
+	// Protected by manifestMu. An ambiguous rename/sync outcome blocks further use.
+	manifestPersistenceFailed bool
 )
 
 const (
@@ -138,6 +141,10 @@ var hashVerifySlots = make(chan struct{}, 4)
 
 // loadServiceToken reads the service-to-service auth token from disk.
 func loadServiceToken() error {
+	if selected, err := loadRegistryScopeTokens(); selected {
+		serviceToken = ""
+		return err
+	}
 	tokenPath := os.Getenv("SERVICE_TOKEN_PATH")
 	if tokenPath == "" {
 		tokenPath = "/run/secure-ai/service-token"
@@ -214,6 +221,10 @@ func readRegularBounded(path string, limit int64) ([]byte, error) {
 // requireServiceToken wraps every non-health handler with Bearer authentication.
 func requireServiceToken(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if len(registryScopeTokens) != 0 {
+			requireRegistryScope("admin", next)(w, r)
+			return
+		}
 		if serviceToken == "" {
 			if insecureDevMode {
 				next(w, r)
@@ -255,18 +266,35 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
-func loadManifest() error {
+func loadManifest() (result error) {
+	previous := manifest
+	defer func() {
+		if result != nil && !manifestPersistenceFailed {
+			manifest = previous
+		}
+	}()
 	// Try runtime manifest first (writable storage)
-	data, err := readRegularBounded(manifestPath, maxManifestBytes)
+	var data []byte
+	var err error
+	if admissionEnabled() {
+		data, err = trustedAdmissionFile(manifestPath, maxManifestBytes)
+	} else {
+		data, err = readRegularBounded(manifestPath, maxManifestBytes)
+	}
 	if err == nil {
 		decoder := json.NewDecoder(strings.NewReader(string(data)))
 		decoder.DisallowUnknownFields()
-		if err := decoder.Decode(&manifest); err != nil {
+		var loaded Manifest
+		if err := decoder.Decode(&loaded); err != nil {
 			return err
 		}
 		var trailing any
 		if err := decoder.Decode(&trailing); err != io.EOF {
 			return fmt.Errorf("manifest must contain exactly one JSON value")
+		}
+		manifest = loaded
+		if loaded.Version == 2 && !admissionEnabled() {
+			return fmt.Errorf("manifest v2 requires explicit helper-v2 mode")
 		}
 		// Runtime manifests are writable state and must never gain trust through a
 		// compatibility default. Missing states fail validation below.
@@ -300,6 +328,9 @@ func loadManifest() error {
 	}
 	if !os.IsNotExist(err) {
 		return fmt.Errorf("read runtime manifest: %w", err)
+	}
+	if admissionEnabled() {
+		return fmt.Errorf("helper-v2 requires an existing validated runtime manifest; explicit new-only initialization is separate")
 	}
 
 	// Fall back to baked-in models.lock.yaml
@@ -336,6 +367,21 @@ func loadManifest() error {
 }
 
 func saveManifest() error {
+	return saveManifestBeforePublish(nil)
+}
+
+func saveManifestBeforePublish(guard func() error) error {
+	if manifestPersistenceFailed {
+		return errManifestDurabilityUnknown
+	}
+	if guard != nil {
+		if err := guard(); err != nil {
+			return err
+		}
+	}
+	if len(manifest.Models) > maxManifestEntries || len(manifest.Events) > maxManifestEntries || len(manifest.Models) > manifestCapacityLimits.Models || len(manifest.Events) > manifestCapacityLimits.Events {
+		return errSafetyCapacity
+	}
 	if err := validateManifest(manifest); err != nil {
 		return err
 	}
@@ -343,8 +389,8 @@ func saveManifest() error {
 	if err != nil {
 		return err
 	}
-	if len(data) > maxManifestBytes {
-		return fmt.Errorf("manifest exceeds %d-byte limit", maxManifestBytes)
+	if len(data) > maxManifestBytes || len(data) > manifestCapacityLimits.Bytes || len(manifest.Events) > manifestCapacityLimits.Events || len(manifest.Models) > manifestCapacityLimits.Models {
+		return errSafetyCapacity
 	}
 	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o750); err != nil {
 		return err
@@ -359,38 +405,56 @@ func saveManifest() error {
 		tmp.Close()
 		return err
 	}
-	if _, err := tmp.Write(data); err != nil {
+	if n, err := manifestPersistence.write(tmp, data); err != nil || n != len(data) {
 		tmp.Close()
-		return err
+		if err != nil {
+			return err
+		}
+		return io.ErrShortWrite
 	}
-	if err := tmp.Sync(); err != nil {
+	if err := manifestPersistence.syncFile(tmp); err != nil {
 		tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmpPath, manifestPath); err != nil {
+	if guard != nil {
+		if err := guard(); err != nil {
+			return err
+		}
+	}
+	if err := manifestPersistence.rename(tmpPath, manifestPath); err != nil {
 		return err
 	}
-	dir, err := os.Open(filepath.Dir(manifestPath))
-	if err == nil {
-		err = dir.Sync()
-		_ = dir.Close()
+	if err := manifestPersistence.syncDirectory(filepath.Dir(manifestPath)); err != nil {
+		manifestPersistenceFailed = true
+		return errManifestDurabilityUnknown
 	}
-	return err
+	return nil
 }
 
 func validateManifest(candidate Manifest) error {
-	if candidate.Version != 1 {
+	if candidate.Version != 1 && candidate.Version != 2 {
 		return fmt.Errorf("unsupported manifest version %d", candidate.Version)
 	}
-	if len(candidate.Models) > 100_000 || len(candidate.Events) > 100_000 {
+	if len(candidate.Models) > maxManifestEntries || len(candidate.Events) > maxManifestEntries {
 		return fmt.Errorf("manifest exceeds entry limits")
 	}
 	names := make(map[string]struct{}, len(candidate.Models))
+	admissionIDs := map[string]bool{}
 	activeFiles := make(map[string]string, len(candidate.Models))
 	for _, artifact := range candidate.Models {
+		if artifact.Admission != nil {
+			id := artifact.Admission.Prepare.AdmissionID
+			if admissionIDs[id] {
+				return fmt.Errorf("duplicate admission identifier")
+			}
+			admissionIDs[id] = true
+		}
+		if artifact.Admission != nil && candidate.Version != 2 {
+			return fmt.Errorf("admission v2 requires explicit manifest version 2")
+		}
 		if err := validateArtifactMetadata(artifact); err != nil {
 			return err
 		}
@@ -413,6 +477,9 @@ func validateManifest(candidate Manifest) error {
 	}
 	previous := "genesis"
 	for i, event := range candidate.Events {
+		if event.Artifact.Admission != nil && candidate.Version != 2 {
+			return fmt.Errorf("admission event requires explicit manifest version 2")
+		}
 		if event.Sequence != int64(i+1) || event.PrevHash != previous || event.Hash != hashRegistryEvent(event) {
 			return fmt.Errorf("audit chain break at event %d", i+1)
 		}
@@ -420,6 +487,9 @@ func validateManifest(candidate Manifest) error {
 			return fmt.Errorf("invalid audit event %d: %w", i+1, err)
 		}
 		previous = event.Hash
+	}
+	if err := validateAdmissionHistory(candidate); err != nil {
+		return err
 	}
 	replayed, err := replayRegistryEvents(candidate.Events)
 	if err != nil {
@@ -465,7 +535,7 @@ func validateArtifactMetadata(artifact Artifact) error {
 			return fmt.Errorf("artifact %q has invalid content-addressed object path", artifact.Name)
 		}
 	}
-	return nil
+	return validateAdmissionMetadata(artifact)
 }
 
 func validateStructuredMetadata(value any) bool {
@@ -597,6 +667,9 @@ func replayRegistryEvents(events []RegistryAuditEvent) ([]Artifact, error) {
 			order = append(order, event.Name)
 		case "promote":
 			seenLifecycleEvent = true
+			if !admissionPromotionPreservesPreparation(current, event.Artifact) {
+				return nil, fmt.Errorf("promotion altered or revived v2 preparation at event %d", i+1)
+			}
 			if event.FromState == "" {
 				if exists {
 					return nil, fmt.Errorf("audit replay event %d has empty source for existing artifact %q", i+1, event.Name)
@@ -885,7 +958,7 @@ func openRegistryRoot() (*os.Root, error) {
 
 // verifyFileHash computes sha256 of a file and compares to expected.
 func verifyFileHash(root *os.Root, rel, expected string) (string, error) {
-	f, err := root.Open(rel)
+	f, err := root.OpenFile(rel, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return "", err
 	}
@@ -907,8 +980,11 @@ func verifyFileHash(root *os.Root, rel, expected string) (string, error) {
 		return "", fmt.Errorf("artifact changed while hashing")
 	}
 	after, err := f.Stat()
+	pathAfter, pathErr := root.Lstat(rel)
 	if err != nil || !os.SameFile(before, after) || before.Size() != after.Size() ||
-		!before.ModTime().Equal(after.ModTime()) || fileLinkCount(after) > 1 {
+		!before.ModTime().Equal(after.ModTime()) || before.Mode() != after.Mode() || fileLinkCount(after) > 1 ||
+		pathErr != nil || !os.SameFile(after, pathAfter) || after.Size() != pathAfter.Size() ||
+		!after.ModTime().Equal(pathAfter.ModTime()) || after.Mode() != pathAfter.Mode() {
 		return "", fmt.Errorf("artifact changed while hashing")
 	}
 	actual := hex.EncodeToString(h.Sum(nil))
@@ -976,8 +1052,8 @@ func verifyArtifactFile(artifact Artifact) (string, error) {
 		}
 		info, err := registryFileInfo(root, storageRel)
 		_ = root.Close()
-		if err != nil || info.Mode().Perm()&0o222 != 0 {
-			return "", fmt.Errorf("content-addressed object must be read-only and regular")
+		if err != nil || info.Mode().Perm()&0o222 != 0 || info.Size() != artifact.SizeBytes {
+			return "", fmt.Errorf("content-addressed object must be read-only, regular and match enrolled size")
 		}
 	}
 	return verifyRegistryFile(storageRel, artifact.SHA256)
@@ -1023,18 +1099,34 @@ func handleGetModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	m, ok := registryArtifactByName(name)
-	if !ok {
+	manifestMu.RLock()
+	if manifestPersistenceFailed {
+		manifestMu.RUnlock()
+		http.Error(w, "manifest durability unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	var data []byte
+	for _, artifact := range manifest.Models {
+		if artifact.Name == name {
+			data, _ = json.Marshal(artifact)
+			break
+		}
+	}
+	manifestMu.RUnlock()
+	if data == nil {
 		http.Error(w, "model not found", http.StatusNotFound)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(m)
+	_, _ = w.Write(data)
 }
 
 func registryArtifactByName(name string) (Artifact, bool) {
 	manifestMu.RLock()
 	defer manifestMu.RUnlock()
+	if manifestPersistenceFailed {
+		return Artifact{}, false
+	}
 	for _, artifact := range manifest.Models {
 		if artifact.Name == name {
 			return artifact, true
@@ -1043,21 +1135,21 @@ func registryArtifactByName(name string) (Artifact, bool) {
 	return Artifact{}, false
 }
 
-// handleModelPath returns the filesystem path for a model.
-// P0 fix: only serves artifacts in "trusted" state — revoked artifacts are blocked.
+// handleModelPath freshly verifies trusted content-addressed bytes. The locator
+// is point-in-time disk evidence, not a lease or proof of loaded memory.
 func handleModelPath(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	name := r.URL.Query().Get("name")
-	if !validArtifactName(name) {
-		http.Error(w, "missing ?name= parameter", http.StatusBadRequest)
+	name, filename, err := modelPathSelector(r.URL.RawQuery)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	m, ok := registryArtifactByName(name)
+	m, ok := registryArtifactBySelector(name, filename)
 	if !ok {
 		http.Error(w, "model not found", http.StatusNotFound)
 		return
@@ -1066,7 +1158,7 @@ func handleModelPath(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusForbidden)
 		json.NewEncoder(w).Encode(map[string]string{
-			"error": fmt.Sprintf("artifact %q is in %q state — only trusted artifacts can be loaded", name, m.State),
+			"error": fmt.Sprintf("artifact %q is in %q state — only trusted artifacts can be loaded", m.Name, m.State),
 		})
 		return
 	}
@@ -1083,14 +1175,17 @@ func handleModelPath(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "content-addressed object failed digest verification", http.StatusConflict)
 		return
 	}
-	current, stillTrusted := registryArtifactByName(name)
+	current, stillTrusted := registryArtifactBySelector(name, filename)
 	if !stillTrusted || current.State != StateTrusted || current.SHA256 != m.SHA256 ||
-		current.ObjectPath != m.ObjectPath {
+		current.ObjectPath != m.ObjectPath || current.Filename != m.Filename || current.Format != m.Format ||
+		current.Name != m.Name || current.SizeBytes != m.SizeBytes {
 		http.Error(w, "artifact trust changed during resolution", http.StatusConflict)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
+		"schema_version": 1, "status": "verified", "safe_to_use": "true",
+		"name": m.Name, "filename": m.Filename, "format": m.Format,
 		"path": path, "sha256": m.SHA256, "size_bytes": m.SizeBytes,
 		"storage_contract": "content-addressed-v1",
 	})
@@ -1099,6 +1194,9 @@ func handleModelPath(w http.ResponseWriter, r *http.Request) {
 func handlePromote(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if rejectLegacyAdmission(w, r) {
 		return
 	}
 
@@ -1227,6 +1325,10 @@ func handlePromote(w http.ResponseWriter, r *http.Request) {
 
 	manifestMu.Lock()
 	defer manifestMu.Unlock()
+	if manifestPersistenceFailed {
+		http.Error(w, errManifestDurabilityUnknown.Error(), http.StatusServiceUnavailable)
+		return
+	}
 	before, err := cloneManifest(manifest)
 	if err != nil {
 		http.Error(w, "failed to prepare manifest update", http.StatusInternalServerError)
@@ -1235,7 +1337,7 @@ func handlePromote(w http.ResponseWriter, r *http.Request) {
 	ensureRegistryEventBaseline()
 	committed := false
 	defer func() {
-		if !committed {
+		if !committed && !manifestPersistenceFailed {
 			manifest = before
 		}
 	}()
@@ -1280,9 +1382,11 @@ func handlePromote(w http.ResponseWriter, r *http.Request) {
 	}
 	appendRegistryEvent("promote", artifact, fromState)
 
-	if err := saveManifest(); err != nil {
-		manifest = before
-		http.Error(w, fmt.Sprintf("failed to save manifest: %v", err), http.StatusInternalServerError)
+	if err := saveAdmissionManifest(); err != nil {
+		if !manifestPersistenceFailed {
+			manifest = before
+		}
+		manifestWriteError(w, err)
 		return
 	}
 	committed = true
@@ -1310,6 +1414,10 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 
 	manifestMu.Lock()
 	defer manifestMu.Unlock()
+	if manifestPersistenceFailed {
+		http.Error(w, errManifestDurabilityUnknown.Error(), http.StatusServiceUnavailable)
+		return
+	}
 	before, err := cloneManifest(manifest)
 	if err != nil {
 		http.Error(w, "failed to prepare manifest update", http.StatusInternalServerError)
@@ -1318,7 +1426,7 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 	ensureRegistryEventBaseline()
 	committed := false
 	defer func() {
-		if !committed {
+		if !committed && !manifestPersistenceFailed {
 			manifest = before
 		}
 	}()
@@ -1336,8 +1444,10 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 			manifest.Models[i].State = StateDeleted
 			appendRegistryEvent("delete", manifest.Models[i], m.State)
 			if err := saveManifest(); err != nil {
-				manifest = before
-				http.Error(w, fmt.Sprintf("failed to save manifest: %v", err), http.StatusInternalServerError)
+				if !manifestPersistenceFailed {
+					manifest = before
+				}
+				manifestWriteError(w, err)
 				return
 			}
 			committed = true
@@ -1345,6 +1455,9 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 			// deleted artifacts are never returned to runtime consumers. Digest
 			// objects can be shared, so retain one while another live record refers to it.
 			storageRel := artifactStorageRel(m)
+			if m.Admission != nil && m.ObjectPath == "" {
+				storageRel = ""
+			} // never remove a prepared v2 source filename
 			storageReferenced := false
 			if m.ObjectPath != "" {
 				for j, other := range manifest.Models {
@@ -1388,6 +1501,10 @@ func handleRevoke(w http.ResponseWriter, r *http.Request) {
 
 	manifestMu.Lock()
 	defer manifestMu.Unlock()
+	if manifestPersistenceFailed {
+		http.Error(w, errManifestDurabilityUnknown.Error(), http.StatusServiceUnavailable)
+		return
+	}
 	before, err := cloneManifest(manifest)
 	if err != nil {
 		http.Error(w, "failed to prepare manifest update", http.StatusInternalServerError)
@@ -1396,7 +1513,7 @@ func handleRevoke(w http.ResponseWriter, r *http.Request) {
 	ensureRegistryEventBaseline()
 	committed := false
 	defer func() {
-		if !committed {
+		if !committed && !manifestPersistenceFailed {
 			manifest = before
 		}
 	}()
@@ -1422,8 +1539,10 @@ func handleRevoke(w http.ResponseWriter, r *http.Request) {
 			manifest.Models[i].State = StateRevoked
 			appendRegistryEvent("revoke", manifest.Models[i], m.State)
 			if err := saveManifest(); err != nil {
-				manifest = before
-				http.Error(w, fmt.Sprintf("failed to save manifest: %v", err), http.StatusInternalServerError)
+				if !manifestPersistenceFailed {
+					manifest = before
+				}
+				manifestWriteError(w, err)
 				return
 			}
 			committed = true
@@ -1452,6 +1571,9 @@ type AcquireRequest struct {
 func handleAcquire(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if rejectLegacyAdmission(w, r) {
 		return
 	}
 
@@ -1495,6 +1617,10 @@ func handleAcquire(w http.ResponseWriter, r *http.Request) {
 
 	manifestMu.Lock()
 	defer manifestMu.Unlock()
+	if manifestPersistenceFailed {
+		http.Error(w, errManifestDurabilityUnknown.Error(), http.StatusServiceUnavailable)
+		return
+	}
 	before, err := cloneManifest(manifest)
 	if err != nil {
 		http.Error(w, "failed to prepare manifest update", http.StatusInternalServerError)
@@ -1503,7 +1629,7 @@ func handleAcquire(w http.ResponseWriter, r *http.Request) {
 	ensureRegistryEventBaseline()
 	committed := false
 	defer func() {
-		if !committed {
+		if !committed && !manifestPersistenceFailed {
 			manifest = before
 		}
 	}()
@@ -1516,9 +1642,11 @@ func handleAcquire(w http.ResponseWriter, r *http.Request) {
 	manifest.Models = append(manifest.Models, artifact)
 	appendRegistryEvent("acquire", artifact, "")
 
-	if err := saveManifest(); err != nil {
-		manifest = before
-		http.Error(w, fmt.Sprintf("failed to save manifest: %v", err), http.StatusInternalServerError)
+	if err := saveAdmissionManifest(); err != nil {
+		if !manifestPersistenceFailed {
+			manifest = before
+		}
+		manifestWriteError(w, err)
 		return
 	}
 	committed = true
@@ -1536,6 +1664,9 @@ func handleQuarantine(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if rejectLegacyAdmission(w, r) {
+		return
+	}
 
 	name := r.URL.Query().Get("name")
 	if !validArtifactName(name) {
@@ -1545,6 +1676,10 @@ func handleQuarantine(w http.ResponseWriter, r *http.Request) {
 
 	manifestMu.Lock()
 	defer manifestMu.Unlock()
+	if manifestPersistenceFailed {
+		http.Error(w, errManifestDurabilityUnknown.Error(), http.StatusServiceUnavailable)
+		return
+	}
 	before, err := cloneManifest(manifest)
 	if err != nil {
 		http.Error(w, "failed to prepare manifest update", http.StatusInternalServerError)
@@ -1553,7 +1688,7 @@ func handleQuarantine(w http.ResponseWriter, r *http.Request) {
 	ensureRegistryEventBaseline()
 	committed := false
 	defer func() {
-		if !committed {
+		if !committed && !manifestPersistenceFailed {
 			manifest = before
 		}
 	}()
@@ -1578,9 +1713,11 @@ func handleQuarantine(w http.ResponseWriter, r *http.Request) {
 			}
 			manifest.Models[i].State = StateQuarantined
 			appendRegistryEvent("quarantine", manifest.Models[i], m.State)
-			if err := saveManifest(); err != nil {
-				manifest = before
-				http.Error(w, fmt.Sprintf("failed to save manifest: %v", err), http.StatusInternalServerError)
+			if err := saveAdmissionManifest(); err != nil {
+				if !manifestPersistenceFailed {
+					manifest = before
+				}
+				manifestWriteError(w, err)
 				return
 			}
 			committed = true
@@ -1756,12 +1893,13 @@ func handleVerifyModel(w http.ResponseWriter, r *http.Request) {
 		safeToUse = "false"
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"status":      "verified",
-		"name":        name,
-		"sha256":      actual,
-		"state":       string(m.State),
-		"safe_to_use": safeToUse,
+	json.NewEncoder(w).Encode(map[string]any{
+		"schema_version": 1,
+		"status":         "verified",
+		"name":           name,
+		"sha256":         actual,
+		"state":          string(m.State),
+		"safe_to_use":    safeToUse,
 	})
 }
 
@@ -1771,7 +1909,15 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	manifestMu.RLock()
+	failed := manifestPersistenceFailed
+	manifestMu.RUnlock()
+	status := "ok"
+	if failed {
+		status = "unavailable"
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
+	json.NewEncoder(w).Encode(map[string]string{"status": status})
 }
 
 func handleStats(w http.ResponseWriter, r *http.Request) {
@@ -1948,18 +2094,23 @@ func runGGUFGuardVerify(modelPath, manifestFile string) (string, error) {
 
 func newRegistryMux() *http.ServeMux {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/admission/capabilities", requireRegistryScopes(handleAdmissionCapabilities, "read", "promote"))
+	mux.HandleFunc("/v2/admission/prepare", requireRegistryScope("promote", handleAdmissionPrepare))
+	mux.HandleFunc("/v2/admission/commit", requireRegistryScope("promote", handleAdmissionCommit))
 	mux.HandleFunc("/health", handleHealth)
-	mux.HandleFunc("/v1/stats", requireServiceToken(handleStats))
-	mux.HandleFunc("/v1/models", requireServiceToken(handleListModels))
-	mux.HandleFunc("/v1/model", requireServiceToken(handleGetModel))
-	mux.HandleFunc("/v1/model/path", requireServiceToken(handleModelPath))
-	mux.HandleFunc("/v1/model/verify", requireServiceToken(handleVerifyModel))
-	mux.HandleFunc("/v1/models/verify-all", requireServiceToken(handleVerifyAll))
-	mux.HandleFunc("/v1/integrity/status", requireServiceToken(handleIntegrityStatus))
-	mux.HandleFunc("/v1/model/verify-manifest", requireServiceToken(handleVerifyGGUFManifest))
+	mux.HandleFunc("/v1/stats", requireRegistryScope("read", handleStats))
+	mux.HandleFunc("/v1/capacity", requireRegistryScope("read", handleCapacity))
+	mux.HandleFunc("/v1/models", requireRegistryScope("read", handleListModels))
+	// The admission producer reconciles exact historical receipts by name here.
+	mux.HandleFunc("/v1/model", requireRegistryScopes(handleGetModel, "read", "promote"))
+	mux.HandleFunc("/v1/model/path", requireRegistryScope("verify", handleModelPath))
+	mux.HandleFunc("/v1/model/verify", requireRegistryScope("verify", handleVerifyModel))
+	mux.HandleFunc("/v1/models/verify-all", requireRegistryScope("verify", handleVerifyAll))
+	mux.HandleFunc("/v1/integrity/status", requireRegistryScope("verify", handleIntegrityStatus))
+	mux.HandleFunc("/v1/model/verify-manifest", requireRegistryScope("verify", handleVerifyGGUFManifest))
 	mux.HandleFunc("/v1/model/acquire", requireServiceToken(handleAcquire))
 	mux.HandleFunc("/v1/model/quarantine", requireServiceToken(handleQuarantine))
-	mux.HandleFunc("/v1/model/promote", requireServiceToken(handlePromote))
+	mux.HandleFunc("/v1/model/promote", requireRegistryScope("promote", handlePromote))
 	mux.HandleFunc("/v1/model/delete", requireServiceToken(handleDelete))
 	mux.HandleFunc("/v1/model/revoke", requireServiceToken(handleRevoke))
 	mux.HandleFunc("/v1/audit", requireServiceToken(handleAuditEvents))
@@ -2005,23 +2156,44 @@ func ensureRegistryDirectory(path string) error {
 }
 
 func main() {
+	if exitCode, handled := runAdmissionCommand(os.Args[1:]); handled {
+		os.Exit(exitCode)
+	}
 	if exitCode, handled := runRegistryCheckpointCommand(os.Args[1:]); handled {
 		os.Exit(exitCode)
 	}
 	// P0: require explicit opt-in for insecure dev mode
 	insecureDevMode = os.Getenv("INSECURE_DEV_MODE") == "true"
 	if insecureDevMode {
-		log.Println("WARNING: INSECURE_DEV_MODE=true — auth will not be enforced for non-health APIs. DO NOT use in production.")
+		log.Println("WARNING: INSECURE_DEV_MODE=true permits missing authentication in legacy all-service mode. DO NOT use in production.")
 	}
 
 	registryDir = os.Getenv("REGISTRY_DIR")
 	if registryDir == "" {
 		registryDir = "/registry"
 	}
-	if err := ensureRegistryDirectory(registryDir); err != nil {
-		log.Fatalf("invalid registry directory: %v", err)
+	var directoryErr error
+	if admissionEnabled() {
+		directoryErr = checkedAdmissionDirectory(registryDir)
+	} else {
+		directoryErr = ensureRegistryDirectory(registryDir)
+	}
+	if directoryErr != nil {
+		log.Fatalf("invalid registry directory: %v", directoryErr)
 	}
 	manifestPath = filepath.Join(registryDir, "manifest.json")
+	if err := initializeAdmission(); err != nil {
+		log.Fatalf("helper admission unavailable: %v", err)
+	}
+	if admissionEnabled() {
+		if _, err := admissionNow(); err != nil {
+			log.Fatalf("helper admission clock unavailable: %v", err)
+		}
+		if err := lockAdmissionStore(); err != nil {
+			log.Fatal(err)
+		}
+		defer admissionStoreLock.Close()
+	}
 	if err := validateGGUFGuardBinary(); err != nil {
 		log.Fatalf("required gguf-guard executable validation failed: %v", err)
 	}
@@ -2043,7 +2215,7 @@ func main() {
 		log.Fatalf("invalid bind address: %v", err)
 	}
 
-	log.Printf("ai-model-registry listening on %s (auth_required=%v)", bind, !insecureDevMode || serviceToken != "")
+	log.Printf("ai-model-registry listening on %s (auth_required=%v)", bind, !insecureDevMode || serviceToken != "" || len(registryScopeTokens) != 0)
 	server := &http.Server{
 		Addr:              bind,
 		Handler:           securityHeaders(newRegistryMux()),

@@ -4,7 +4,14 @@
   "title": "AI Model Registry Artifact",
   "description": "Schema for artifacts stored in the ai-model-registry manifest",
   "type": "object",
-  "required": ["name", "format", "filename", "sha256", "size_bytes", "state"],
+  "required": [
+    "name",
+    "format",
+    "filename",
+    "sha256",
+    "size_bytes",
+    "state"
+  ],
   "properties": {
     "name": {
       "type": "string",
@@ -15,7 +22,10 @@
     "format": {
       "type": "string",
       "description": "Artifact format, inferred from filename extension",
-      "enum": ["gguf", "safetensors"]
+      "enum": [
+        "gguf",
+        "safetensors"
+      ]
     },
     "filename": {
       "type": "string",
@@ -50,20 +60,32 @@
     },
     "state": {
       "type": "string",
-      "description": "Trust state — only 'trusted' artifacts can be loaded at runtime",
-      "enum": ["acquired", "quarantined", "trusted", "revoked", "deleted"]
+      "description": "Trust state \u2014 only 'trusted' artifacts can be loaded at runtime",
+      "enum": [
+        "acquired",
+        "quarantined",
+        "trusted",
+        "revoked",
+        "deleted"
+      ]
     },
     "scan_results": {
       "type": "object",
       "description": "Results from security scanners (e.g. modelscan, gguf-guard)",
       "maxProperties": 64,
-      "additionalProperties": { "type": "string", "maxLength": 1024 }
+      "additionalProperties": {
+        "type": "string",
+        "maxLength": 1024
+      }
     },
     "scanner_versions": {
       "type": "object",
       "description": "Versions of scanners used during quarantine",
       "maxProperties": 64,
-      "additionalProperties": { "type": "string", "maxLength": 1024 }
+      "additionalProperties": {
+        "type": "string",
+        "maxLength": 1024
+      }
     },
     "policy_version": {
       "type": "string",
@@ -83,7 +105,768 @@
       "type": "string",
       "description": "Relative path to the gguf-guard integrity manifest file",
       "maxLength": 4096
+    },
+    "admission": {
+      "$ref": "#/$defs/AdmissionRecord"
     }
   },
-  "additionalProperties": false
+  "additionalProperties": false,
+  "$defs": {
+    "AdmissionPolicyBundle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "sha256",
+        "components"
+      ],
+      "properties": {
+        "version": {
+          "const": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "components": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "policy.yaml",
+            "models.lock.yaml",
+            "sources.allowlist.yaml"
+          ],
+          "properties": {
+            "policy.yaml": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "models.lock.yaml": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "sources.allowlist.yaml": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          }
+        }
+      }
+    },
+    "AdmissionConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "policy_dir",
+        "policy_bundle_sha256",
+        "outbox_dir",
+        "pipeline_sha256",
+        "producer_uid",
+        "outbox_gid",
+        "max_artifact_bytes",
+        "retained_byte_limit",
+        "min_free_bytes"
+      ],
+      "properties": {
+        "version": {
+          "const": 1
+        },
+        "policy_dir": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "policy_bundle_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "outbox_dir": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "pipeline_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "producer_uid": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
+        },
+        "outbox_gid": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
+        },
+        "max_artifact_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 68719476736
+        },
+        "retained_byte_limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1125899906842624
+        },
+        "min_free_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1125899906842624
+        }
+      }
+    },
+    "AdmissionPrepareRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "admission_id",
+        "name",
+        "filename",
+        "artifact_kind",
+        "format",
+        "sha256",
+        "size_bytes",
+        "source",
+        "source_revision",
+        "policy_bundle",
+        "evidence_budget_bytes",
+        "context_sha256"
+      ],
+      "properties": {
+        "protocol_version": {
+          "const": 2
+        },
+        "admission_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "filename": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+        },
+        "artifact_kind": {
+          "const": "file"
+        },
+        "format": {
+          "enum": [
+            "gguf",
+            "safetensors"
+          ]
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 68719476736
+        },
+        "source": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "source_revision": {
+          "type": "string",
+          "pattern": "^([0-9a-f]{40})?$"
+        },
+        "policy_bundle": {
+          "$ref": "#/$defs/AdmissionPolicyBundle"
+        },
+        "evidence_budget_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1048576
+        },
+        "context_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "AdmissionEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "filename",
+        "sha256",
+        "size_bytes"
+      ],
+      "properties": {
+        "role": {
+          "enum": [
+            "pipeline-report",
+            "gguf-integrity"
+          ]
+        },
+        "filename": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1048576
+        }
+      }
+    },
+    "AdmissionCommitRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "admission_id",
+        "prepare_receipt_sha256",
+        "evidence"
+      ],
+      "properties": {
+        "protocol_version": {
+          "const": 2
+        },
+        "admission_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "prepare_receipt_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/AdmissionEvidence"
+          }
+        }
+      }
+    },
+    "AdmissionReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "phase",
+        "admission_id",
+        "request_sha256",
+        "binding_sha256",
+        "boot_id",
+        "expires_boot_ns",
+        "reserved_registry_bytes",
+        "reserved_outbox_bytes",
+        "event_sequence",
+        "created_at",
+        "sha256"
+      ],
+      "properties": {
+        "version": {
+          "const": 2
+        },
+        "phase": {
+          "enum": [
+            "prepared",
+            "committed"
+          ]
+        },
+        "admission_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "request_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "binding_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "boot_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "expires_boot_ns": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]{0,18}$"
+        },
+        "reserved_registry_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 68720525312
+        },
+        "reserved_outbox_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 68728913920
+        },
+        "event_sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100000
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "AdmissionScannerOutcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "passed",
+        "verdict",
+        "available",
+        "scanner",
+        "scanner_version",
+        "reason",
+        "scanned_count"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 2
+        },
+        "passed": {
+          "type": "boolean"
+        },
+        "verdict": {
+          "enum": [
+            "pass",
+            "fail",
+            "not_applicable",
+            "unavailable",
+            "error"
+          ]
+        },
+        "available": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "scanner": {
+          "enum": [
+            "modelscan",
+            "fickling",
+            "modelaudit",
+            "gguf-guard"
+          ]
+        },
+        "scanner_version": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 1024
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "scanned_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        }
+      }
+    },
+    "AdmissionGate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "verdict",
+        "reason",
+        "count",
+        "assurance"
+      ],
+      "properties": {
+        "verdict": {
+          "enum": [
+            "pass",
+            "fail",
+            "not_applicable",
+            "not_required",
+            "unavailable",
+            "error"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "assurance": {
+          "enum": [
+            "",
+            "none",
+            "recorded",
+            "cosign-verified"
+          ]
+        }
+      }
+    },
+    "AdmissionReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "admission_id",
+        "filename",
+        "sha256",
+        "size_bytes",
+        "source",
+        "source_revision",
+        "policy_bundle",
+        "pipeline_sha256",
+        "gates",
+        "scanners"
+      ],
+      "properties": {
+        "version": {
+          "const": 2
+        },
+        "admission_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "filename": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 68719476736
+        },
+        "source": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "source_revision": {
+          "type": "string",
+          "pattern": "^([0-9a-f]{40})?$"
+        },
+        "policy_bundle": {
+          "$ref": "#/$defs/AdmissionPolicyBundle"
+        },
+        "pipeline_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "gates": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "source_policy",
+            "format_gate",
+            "hash_pin",
+            "provenance",
+            "polyglot_check",
+            "entropy",
+            "weight_stats",
+            "smoke_test"
+          ],
+          "properties": {
+            "source_policy": {
+              "$ref": "#/$defs/AdmissionGate"
+            },
+            "format_gate": {
+              "$ref": "#/$defs/AdmissionGate"
+            },
+            "hash_pin": {
+              "$ref": "#/$defs/AdmissionGate"
+            },
+            "provenance": {
+              "$ref": "#/$defs/AdmissionGate"
+            },
+            "polyglot_check": {
+              "$ref": "#/$defs/AdmissionGate"
+            },
+            "entropy": {
+              "$ref": "#/$defs/AdmissionGate"
+            },
+            "weight_stats": {
+              "$ref": "#/$defs/AdmissionGate"
+            },
+            "smoke_test": {
+              "$ref": "#/$defs/AdmissionGate"
+            }
+          }
+        },
+        "scanners": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "modelscan",
+            "fickling",
+            "modelaudit",
+            "gguf_guard"
+          ],
+          "properties": {
+            "modelscan": {
+              "$ref": "#/$defs/AdmissionScannerOutcome"
+            },
+            "fickling": {
+              "$ref": "#/$defs/AdmissionScannerOutcome"
+            },
+            "modelaudit": {
+              "$ref": "#/$defs/AdmissionScannerOutcome"
+            },
+            "gguf_guard": {
+              "$ref": "#/$defs/AdmissionScannerOutcome"
+            }
+          }
+        }
+      }
+    },
+    "AdmissionScanContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pipeline_sha256",
+        "require_behavior"
+      ],
+      "properties": {
+        "pipeline_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "require_behavior": {
+          "type": "boolean"
+        }
+      }
+    },
+    "AdmissionRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "context",
+        "prepare",
+        "prepare_receipt"
+      ],
+      "properties": {
+        "version": {
+          "const": 2
+        },
+        "context": {
+          "$ref": "#/$defs/AdmissionScanContext"
+        },
+        "prepare": {
+          "$ref": "#/$defs/AdmissionPrepareRequest"
+        },
+        "prepare_receipt": {
+          "$ref": "#/$defs/AdmissionReceipt"
+        },
+        "commit": {
+          "$ref": "#/$defs/AdmissionCommitRequest"
+        },
+        "commit_receipt": {
+          "$ref": "#/$defs/AdmissionReceipt"
+        },
+        "report": {
+          "$ref": "#/$defs/AdmissionReport"
+        }
+      },
+      "dependentRequired": {
+        "commit": [
+          "commit_receipt",
+          "report"
+        ],
+        "commit_receipt": [
+          "commit",
+          "report"
+        ],
+        "report": [
+          "commit",
+          "commit_receipt"
+        ]
+      },
+      "description": "Stored only in manifest version2. Full encoded Artifact is limited to65536bytes. Preparation/commit receipt and request bindings are additionally validated by the service; absence of a commit can never be trusted."
+    },
+    "AdmissionCapabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "service",
+        "protocol_version",
+        "mode",
+        "artifact_kinds",
+        "formats",
+        "scanner_evidence_version",
+        "policy_bundle",
+        "pipeline_sha256",
+        "receipt_lookup",
+        "persistence_ready",
+        "limits",
+        "scan_context",
+        "context_sha256"
+      ],
+      "properties": {
+        "service": {
+          "const": "ai-model-registry"
+        },
+        "protocol_version": {
+          "const": 2
+        },
+        "mode": {
+          "const": "helper-v2-required"
+        },
+        "artifact_kinds": {
+          "type": "array",
+          "items": {
+            "const": "file"
+          },
+          "minItems": 1,
+          "maxItems": 1
+        },
+        "formats": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "gguf",
+              "safetensors"
+            ]
+          },
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true
+        },
+        "scanner_evidence_version": {
+          "const": 2
+        },
+        "policy_bundle": {
+          "$ref": "#/$defs/AdmissionPolicyBundle"
+        },
+        "pipeline_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "receipt_lookup": {
+          "const": "/v1/model?name={name}"
+        },
+        "persistence_ready": {
+          "const": true
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "max_body_bytes",
+            "max_evidence_files",
+            "max_evidence_total_bytes",
+            "max_artifact_record_bytes",
+            "max_prepared",
+            "max_concurrent_commits",
+            "prepare_lifetime_seconds",
+            "commit_work_seconds",
+            "max_artifact_bytes",
+            "retained_byte_limit",
+            "min_free_bytes",
+            "outbox_overhead_bytes",
+            "manifest_scratch_bytes"
+          ],
+          "properties": {
+            "max_body_bytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65536
+            },
+            "max_evidence_files": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 32
+            },
+            "max_evidence_total_bytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1048576
+            },
+            "max_artifact_record_bytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65536
+            },
+            "max_prepared": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 32
+            },
+            "max_concurrent_commits": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2
+            },
+            "prepare_lifetime_seconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1800
+            },
+            "commit_work_seconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20
+            },
+            "max_artifact_bytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 68719476736
+            },
+            "retained_byte_limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1125899906842624
+            },
+            "min_free_bytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1125899906842624
+            },
+            "outbox_overhead_bytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 8388608
+            },
+            "manifest_scratch_bytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 16777216
+            }
+          }
+        },
+        "scan_context": {
+          "$ref": "#/$defs/AdmissionScanContext"
+        },
+        "context_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    }
+  }
 }

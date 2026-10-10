@@ -97,3 +97,60 @@ func TestAPIRequestRejectsOversizedResponse(t *testing.T) {
 		t.Fatal("expected oversized response to fail")
 	}
 }
+
+func TestTypedVerificationMetadataRetainsLegacyCompatibility(t *testing.T) {
+	digest := strings.Repeat("a", 64)
+	for _, schema := range []string{"", `"schema_version":1,`} {
+		data := []byte(`{` + schema + `"status":"verified","sha256":"` + digest + `","state":"trusted","safe_to_use":"true"}`)
+		result, err := decodeVerificationResponse(data, http.StatusOK)
+		if err != nil || result.SHA256 != digest || result.SafeToUse != "true" {
+			t.Fatalf("numeric/legacy contract: %#v %v", result, err)
+		}
+	}
+	for _, data := range []string{`{"schema_version":"1"}`, `{"status":"verified"}`, `{"schema_version":2,"status":"verified","sha256":"` + digest + `","safe_to_use":"true"}`} {
+		if _, err := decodeVerificationResponse([]byte(data), http.StatusOK); err == nil {
+			t.Fatal("invalid verified result accepted")
+		}
+	}
+}
+
+func TestScopedAdministratorCredentialSelectedWithoutLegacyFallback(t *testing.T) {
+	dir := t.TempDir()
+	admin := dir + "/admin"
+	if err := os.WriteFile(admin, []byte(strings.Repeat("d", 64)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("REGISTRY_ADMIN_TOKEN_PATH", admin)
+	t.Setenv("SERVICE_TOKEN_PATH", dir+"/missing-legacy")
+	if token, err := readServiceToken(); err != nil || token != strings.Repeat("d", 64) {
+		t.Fatalf("administrator not selected: %q %v", token, err)
+	}
+	legacy := dir + "/legacy"
+	if err := os.WriteFile(legacy, []byte(strings.Repeat("e", 64)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SERVICE_TOKEN_PATH", legacy)
+	t.Setenv("REGISTRY_ADMIN_TOKEN_PATH", dir+"/missing-admin")
+	if _, err := readServiceToken(); err == nil {
+		t.Fatal("missing explicit administrator credential accepted")
+	}
+}
+
+func TestTypedPathMetadataRetainsLocatorAndRejectsFailures(t *testing.T) {
+	digest := strings.Repeat("a", 64)
+	locator := `"path":"/registry/objects/model","sha256":"` + digest + `","size_bytes":22,"storage_contract":"content-addressed-v1"`
+	for _, metadata := range []string{"", `"schema_version":1,"status":"verified","safe_to_use":"true","name":"demo","filename":"demo.safetensors","format":"safetensors",`} {
+		result, err := decodePathResponse([]byte(`{`+metadata+locator+`}`), http.StatusOK)
+		if err != nil || result.Path != "/registry/objects/model" || result.SizeBytes != 22 {
+			t.Fatalf("locator compatibility: %#v %v", result, err)
+		}
+		if _, err := decodePathResponse([]byte(`{`+metadata+locator+`}`), http.StatusConflict); err == nil {
+			t.Fatal("non200 locator accepted")
+		}
+	}
+	for _, metadata := range []string{`"schema_version":"1",`, `"schema_version":1,"status":"unavailable","safe_to_use":"false",`, `"schema_version":2,`} {
+		if _, err := decodePathResponse([]byte(`{`+metadata+locator+`}`), http.StatusOK); err == nil {
+			t.Fatal("unsafe metadata accepted")
+		}
+	}
+}

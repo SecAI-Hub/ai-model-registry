@@ -1,7 +1,7 @@
 openapi: "3.0.3"
 info:
   title: ai-model-registry API
-  version: "1.0.0"
+  version: "2.0.0"
   description: >
     Security-first AI artifact registry with digest-based storage,
     policy-gated promotion, explicit trust states, and fail-closed
@@ -74,6 +74,7 @@ paths:
   /v1/model:
     get:
       summary: Get a single artifact by name
+      description: Read, promote or admin authority; promotion clients reconcile typed admission receipts here.
       operationId: getModel
       tags: [artifacts]
       parameters:
@@ -94,15 +95,26 @@ paths:
 
   /v1/model/path:
     get:
-      summary: Get filesystem path for a trusted artifact
+      summary: Freshly verify a trusted content-addressed locator
+      description: >
+        Requires verify or admin authority in scoped deployments. Exactly one
+        nonempty name or exact enrolled filename selector is accepted. Duplicate
+        selectors and ambiguous enrollment are refused. Current disk verification
+        is point-in-time evidence, not a lease or proof of loaded memory/VRAM.
       operationId: getModelPath
       tags: [artifacts]
       parameters:
         - name: name
           in: query
-          required: true
+          required: false
           schema:
             type: string
+        - name: filename
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 512
       responses:
         "200":
           description: Digest-bound content-addressed runtime locator
@@ -110,8 +122,24 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [path, sha256, size_bytes, storage_contract]
+                required: [schema_version, status, safe_to_use, name, filename, format, path, sha256, size_bytes, storage_contract]
                 properties:
+                  schema_version:
+                    type: integer
+                    enum: [1]
+                  status:
+                    type: string
+                    enum: [verified]
+                  safe_to_use:
+                    type: string
+                    enum: ["true"]
+                  name:
+                    type: string
+                  filename:
+                    type: string
+                  format:
+                    type: string
+                    enum: [gguf, safetensors]
                   path:
                     type: string
                   sha256:
@@ -124,8 +152,10 @@ paths:
                   storage_contract:
                     type: string
                     const: content-addressed-v1
+        "400":
+          description: Missing, duplicate, combined or invalid selector
         "403":
-          description: Artifact is not in trusted state
+          description: Invalid verification authority or artifact is not trusted
         "404":
           description: Model not found or file missing
         "409":
@@ -345,12 +375,123 @@ paths:
         "404":
           description: Model not found
 
+  /v2/admission/capabilities:
+    get:
+      summary: Authenticated helper-only admission preflight without file effects
+      description: Read, promote or admin authority in scoped deployments.
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          description: Configured helper capabilities
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdmissionCapabilities'
+        '503':
+          description: Admission configuration or manifest durability unavailable
+  /v2/admission/prepare:
+    post:
+      summary: Reserve and durably prepare a file admission
+      description: Promote or admin authority; policy and transaction checks remain required.
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          description: Current artifact and original receipt on exact replay
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Artifact'
+        '503':
+          description: Admission configuration or manifest durability unavailable
+        '201':
+          description: New durable artifact phase committed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Artifact'
+        '400':
+          description: Invalid, missing, duplicate, or unsupported request fields
+        '409':
+          description: Changed replay, state, policy, expiry or identity conflict
+        '413':
+          description: Body/evidence size limit exceeded
+        '429':
+          description: Bounded commit workers busy
+        '507':
+          description: Reserved metadata/event/retained-byte headroom unavailable
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema: &id001
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        description: Must equal admission_id; retries reuse the exact JSON body bytes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdmissionPrepareRequest'
+  /v2/admission/commit:
+    post:
+      summary: Commit exact prepared artifact/evidence or return its historical receipt
+      description: Promote or admin authority; exact preparation, staged evidence and transaction checks remain required.
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          description: Current artifact and original receipt on exact replay
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Artifact'
+        '503':
+          description: Admission configuration or manifest durability unavailable
+        '201':
+          description: New durable artifact phase committed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Artifact'
+        '400':
+          description: Invalid, missing, duplicate, or unsupported request fields
+        '409':
+          description: Changed replay, state, policy, expiry or identity conflict
+        '413':
+          description: Body/evidence size limit exceeded
+        '429':
+          description: Bounded commit workers busy
+        '507':
+          description: Reserved metadata/event/retained-byte headroom unavailable
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema: *id001
+        description: Must equal admission_id; retries reuse the exact JSON body bytes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdmissionCommitRequest'
+
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
-      description: Service-to-service token
+      description: >
+        Distinct read/verify/promote/admin credentials when all four scope paths
+        are configured. Promote authorizes admission v2 prepare/commit and exact
+        single-model receipt lookup; read/promote authorize capability reads.
+        Admin also authorizes delete/revoke and audit administration; verify
+        authorizes paths and integrity; read authorizes diagnostic metadata.
+        With no scoped paths, the legacy service credential authorizes all
+        non-health operations without scope separation.
 
   schemas:
     Artifact:
@@ -404,6 +545,9 @@ components:
         gguf_guard_manifest:
           type: string
           maxLength: 4096
+
+        admission:
+          $ref: "#/components/schemas/AdmissionRecord"
 
     AcquireRequest:
       type: object
@@ -508,6 +652,9 @@ components:
     VerifyResult:
       type: object
       properties:
+        schema_version:
+          type: integer
+          enum: [1]
         status:
           type: string
           enum: [verified, failed]
@@ -548,3 +695,586 @@ components:
         checked:
           type: integer
           description: Number of registry records reported, including deleted records skipped as expected absence
+
+    AdmissionPolicyBundle:
+      type: object
+      additionalProperties: false
+      required:
+      - version
+      - sha256
+      - components
+      properties:
+        version:
+          enum:
+          - 1
+        sha256:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        components:
+          type: object
+          additionalProperties: false
+          required:
+          - policy.yaml
+          - models.lock.yaml
+          - sources.allowlist.yaml
+          properties:
+            policy.yaml:
+              type: string
+              pattern: ^[0-9a-f]{64}$
+            models.lock.yaml:
+              type: string
+              pattern: ^[0-9a-f]{64}$
+            sources.allowlist.yaml:
+              type: string
+              pattern: ^[0-9a-f]{64}$
+    AdmissionConfig:
+      type: object
+      additionalProperties: false
+      required:
+      - version
+      - policy_dir
+      - policy_bundle_sha256
+      - outbox_dir
+      - pipeline_sha256
+      - producer_uid
+      - outbox_gid
+      - max_artifact_bytes
+      - retained_byte_limit
+      - min_free_bytes
+      properties:
+        version:
+          enum:
+          - 1
+        policy_dir:
+          type: string
+          maxLength: 4096
+        policy_bundle_sha256:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        outbox_dir:
+          type: string
+          maxLength: 4096
+        pipeline_sha256:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        producer_uid:
+          type: integer
+          minimum: 0
+          maximum: 2147483647
+        outbox_gid:
+          type: integer
+          minimum: 0
+          maximum: 2147483647
+        max_artifact_bytes:
+          type: integer
+          minimum: 1
+          maximum: 68719476736
+        retained_byte_limit:
+          type: integer
+          minimum: 1
+          maximum: 1125899906842624
+        min_free_bytes:
+          type: integer
+          minimum: 1
+          maximum: 1125899906842624
+    AdmissionPrepareRequest:
+      type: object
+      additionalProperties: false
+      required:
+      - protocol_version
+      - admission_id
+      - name
+      - filename
+      - artifact_kind
+      - format
+      - sha256
+      - size_bytes
+      - source
+      - source_revision
+      - policy_bundle
+      - evidence_budget_bytes
+      - context_sha256
+      properties:
+        protocol_version:
+          enum:
+          - 2
+        admission_id:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        filename:
+          type: string
+          pattern: ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$
+        artifact_kind:
+          enum:
+          - file
+        format:
+          enum:
+          - gguf
+          - safetensors
+        sha256:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        size_bytes:
+          type: integer
+          minimum: 1
+          maximum: 68719476736
+        source:
+          type: string
+          maxLength: 4096
+        source_revision:
+          type: string
+          pattern: ^([0-9a-f]{40})?$
+        policy_bundle:
+          $ref: '#/components/schemas/AdmissionPolicyBundle'
+        evidence_budget_bytes:
+          type: integer
+          minimum: 1
+          maximum: 1048576
+        context_sha256:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+    AdmissionEvidence:
+      type: object
+      additionalProperties: false
+      required:
+      - role
+      - filename
+      - sha256
+      - size_bytes
+      properties:
+        role:
+          enum:
+          - pipeline-report
+          - gguf-integrity
+        filename:
+          type: string
+          pattern: ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$
+        sha256:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        size_bytes:
+          type: integer
+          minimum: 1
+          maximum: 1048576
+    AdmissionCommitRequest:
+      type: object
+      additionalProperties: false
+      required:
+      - protocol_version
+      - admission_id
+      - prepare_receipt_sha256
+      - evidence
+      properties:
+        protocol_version:
+          enum:
+          - 2
+        admission_id:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        prepare_receipt_sha256:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        evidence:
+          type: array
+          minItems: 1
+          maxItems: 32
+          items:
+            $ref: '#/components/schemas/AdmissionEvidence'
+    AdmissionReceipt:
+      type: object
+      additionalProperties: false
+      required:
+      - version
+      - phase
+      - admission_id
+      - request_sha256
+      - binding_sha256
+      - boot_id
+      - expires_boot_ns
+      - reserved_registry_bytes
+      - reserved_outbox_bytes
+      - event_sequence
+      - created_at
+      - sha256
+      properties:
+        version:
+          enum:
+          - 2
+        phase:
+          enum:
+          - prepared
+          - committed
+        admission_id:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        request_sha256:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        binding_sha256:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        boot_id:
+          type: string
+          pattern: ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
+        expires_boot_ns:
+          type: string
+          pattern: ^[1-9][0-9]{0,18}$
+        reserved_registry_bytes:
+          type: integer
+          minimum: 1
+          maximum: 68720525312
+        reserved_outbox_bytes:
+          type: integer
+          minimum: 1
+          maximum: 68728913920
+        event_sequence:
+          type: integer
+          minimum: 1
+          maximum: 100000
+        created_at:
+          type: string
+          format: date-time
+        sha256:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+    AdmissionScannerOutcome:
+      type: object
+      additionalProperties: false
+      required:
+      - schema_version
+      - passed
+      - verdict
+      - available
+      - scanner
+      - scanner_version
+      - reason
+      - scanned_count
+      properties:
+        schema_version:
+          enum:
+          - 2
+        passed:
+          type: boolean
+        verdict:
+          enum:
+          - pass
+          - fail
+          - not_applicable
+          - unavailable
+          - error
+        available:
+          type: boolean
+          nullable: true
+        scanner:
+          enum:
+          - modelscan
+          - fickling
+          - modelaudit
+          - gguf-guard
+        scanner_version:
+          type: string
+          maxLength: 1024
+          nullable: true
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1024
+        scanned_count:
+          type: integer
+          minimum: 0
+          maximum: 9223372036854775807
+    AdmissionGate:
+      type: object
+      additionalProperties: false
+      required:
+      - verdict
+      - reason
+      - count
+      - assurance
+      properties:
+        verdict:
+          enum:
+          - pass
+          - fail
+          - not_applicable
+          - not_required
+          - unavailable
+          - error
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1024
+        count:
+          type: integer
+          minimum: 0
+          maximum: 9223372036854775807
+        assurance:
+          enum:
+          - ''
+          - none
+          - recorded
+          - cosign-verified
+    AdmissionReport:
+      type: object
+      additionalProperties: false
+      required:
+      - version
+      - admission_id
+      - filename
+      - sha256
+      - size_bytes
+      - source
+      - source_revision
+      - policy_bundle
+      - pipeline_sha256
+      - gates
+      - scanners
+      properties:
+        version:
+          enum:
+          - 2
+        admission_id:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        filename:
+          type: string
+          pattern: ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$
+        sha256:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        size_bytes:
+          type: integer
+          minimum: 1
+          maximum: 68719476736
+        source:
+          type: string
+          maxLength: 4096
+        source_revision:
+          type: string
+          pattern: ^([0-9a-f]{40})?$
+        policy_bundle:
+          $ref: '#/components/schemas/AdmissionPolicyBundle'
+        pipeline_sha256:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        gates:
+          type: object
+          additionalProperties: false
+          required:
+          - source_policy
+          - format_gate
+          - hash_pin
+          - provenance
+          - polyglot_check
+          - entropy
+          - weight_stats
+          - smoke_test
+          properties:
+            source_policy:
+              $ref: '#/components/schemas/AdmissionGate'
+            format_gate:
+              $ref: '#/components/schemas/AdmissionGate'
+            hash_pin:
+              $ref: '#/components/schemas/AdmissionGate'
+            provenance:
+              $ref: '#/components/schemas/AdmissionGate'
+            polyglot_check:
+              $ref: '#/components/schemas/AdmissionGate'
+            entropy:
+              $ref: '#/components/schemas/AdmissionGate'
+            weight_stats:
+              $ref: '#/components/schemas/AdmissionGate'
+            smoke_test:
+              $ref: '#/components/schemas/AdmissionGate'
+        scanners:
+          type: object
+          additionalProperties: false
+          required:
+          - modelscan
+          - fickling
+          - modelaudit
+          - gguf_guard
+          properties:
+            modelscan:
+              $ref: '#/components/schemas/AdmissionScannerOutcome'
+            fickling:
+              $ref: '#/components/schemas/AdmissionScannerOutcome'
+            modelaudit:
+              $ref: '#/components/schemas/AdmissionScannerOutcome'
+            gguf_guard:
+              $ref: '#/components/schemas/AdmissionScannerOutcome'
+    AdmissionScanContext:
+      type: object
+      additionalProperties: false
+      required:
+      - pipeline_sha256
+      - require_behavior
+      properties:
+        pipeline_sha256:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        require_behavior:
+          type: boolean
+    AdmissionRecord:
+      type: object
+      additionalProperties: false
+      required:
+      - version
+      - context
+      - prepare
+      - prepare_receipt
+      properties:
+        version:
+          enum:
+          - 2
+        context:
+          $ref: '#/components/schemas/AdmissionScanContext'
+        prepare:
+          $ref: '#/components/schemas/AdmissionPrepareRequest'
+        prepare_receipt:
+          $ref: '#/components/schemas/AdmissionReceipt'
+        commit:
+          $ref: '#/components/schemas/AdmissionCommitRequest'
+        commit_receipt:
+          $ref: '#/components/schemas/AdmissionReceipt'
+        report:
+          $ref: '#/components/schemas/AdmissionReport'
+      description: Stored only in manifest version2. Full encoded Artifact is limited
+        to65536bytes. Preparation/commit receipt and request bindings are additionally
+        validated by the service; absence of a commit can never be trusted.
+    AdmissionCapabilities:
+      type: object
+      additionalProperties: false
+      required:
+      - service
+      - protocol_version
+      - mode
+      - artifact_kinds
+      - formats
+      - scanner_evidence_version
+      - policy_bundle
+      - pipeline_sha256
+      - receipt_lookup
+      - persistence_ready
+      - limits
+      - scan_context
+      - context_sha256
+      properties:
+        service:
+          enum:
+          - ai-model-registry
+        protocol_version:
+          enum:
+          - 2
+        mode:
+          enum:
+          - helper-v2-required
+        artifact_kinds:
+          type: array
+          items:
+            enum:
+            - file
+          minItems: 1
+          maxItems: 1
+        formats:
+          type: array
+          items:
+            enum:
+            - gguf
+            - safetensors
+          minItems: 2
+          maxItems: 2
+          uniqueItems: true
+        scanner_evidence_version:
+          enum:
+          - 2
+        policy_bundle:
+          $ref: '#/components/schemas/AdmissionPolicyBundle'
+        pipeline_sha256:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        receipt_lookup:
+          enum:
+          - /v1/model?name={name}
+        persistence_ready:
+          enum:
+          - true
+        limits:
+          type: object
+          additionalProperties: false
+          required:
+          - max_body_bytes
+          - max_evidence_files
+          - max_evidence_total_bytes
+          - max_artifact_record_bytes
+          - max_prepared
+          - max_concurrent_commits
+          - prepare_lifetime_seconds
+          - commit_work_seconds
+          - max_artifact_bytes
+          - retained_byte_limit
+          - min_free_bytes
+          - outbox_overhead_bytes
+          - manifest_scratch_bytes
+          properties:
+            max_body_bytes:
+              type: integer
+              minimum: 1
+              maximum: 65536
+            max_evidence_files:
+              type: integer
+              minimum: 1
+              maximum: 32
+            max_evidence_total_bytes:
+              type: integer
+              minimum: 1
+              maximum: 1048576
+            max_artifact_record_bytes:
+              type: integer
+              minimum: 1
+              maximum: 65536
+            max_prepared:
+              type: integer
+              minimum: 1
+              maximum: 32
+            max_concurrent_commits:
+              type: integer
+              minimum: 1
+              maximum: 2
+            prepare_lifetime_seconds:
+              type: integer
+              minimum: 1
+              maximum: 1800
+            commit_work_seconds:
+              type: integer
+              minimum: 1
+              maximum: 20
+            max_artifact_bytes:
+              type: integer
+              minimum: 1
+              maximum: 68719476736
+            retained_byte_limit:
+              type: integer
+              minimum: 1
+              maximum: 1125899906842624
+            min_free_bytes:
+              type: integer
+              minimum: 1
+              maximum: 1125899906842624
+            outbox_overhead_bytes:
+              type: integer
+              minimum: 1
+              maximum: 8388608
+            manifest_scratch_bytes:
+              type: integer
+              minimum: 1
+              maximum: 16777216
+        scan_context:
+          $ref: '#/components/schemas/AdmissionScanContext'
+        context_sha256:
+          type: string
+          pattern: ^[0-9a-f]{64}$

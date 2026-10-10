@@ -83,13 +83,18 @@ installed binary digest and fails if it is missing or replaced.
 
 ## API
 
+The optional standalone [helper admission v2 contract](ADMISSION_V2.md) adds
+capability/prepare/commit and typed historical receipts. Its companion producer
+and sandbox qualification are in progress; see that document before selecting
+`helper-v2-required` mode.
+
 | Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
 | `/health` | GET | No | Minimal liveness check |
 | `/v1/stats` | GET | Token | Artifact and lifecycle-state counts |
 | `/v1/models` | GET | Token | List all artifacts (all states) |
 | `/v1/model?name=X` | GET | Token | Get single artifact by name |
-| `/v1/model/path?name=X` | GET | Token | Resolve a digest-bound content-addressed locator (trusted artifacts only) |
+| `/v1/model/path?name=X` or `?filename=X` | GET | Verify/admin scope | Freshly verify a content-addressed locator (trusted artifacts only; exactly one selector) |
 | `/v1/model/verify?name=X` | POST | Token | Verify artifact hash (returns `safe_to_use`) |
 | `/v1/models/verify-all` | POST | Token | Batch integrity verification |
 | `/v1/integrity/status` | GET | Token | Last integrity check result |
@@ -129,9 +134,39 @@ See [schemas/openapi.yaml](schemas/openapi.yaml) for the full specification.
 
 **Key invariant:** `/v1/model/path` only resolves `trusted` artifacts that have a
 content-addressed object. Its response binds `path`, `sha256`, `size_bytes`, and
-`storage_contract: content-addressed-v1`. Consumers must open the returned path
+`storage_contract: content-addressed-v1`, with numeric `schema_version: 1`,
+`status: verified`, `safe_to_use: "true"`, `name`, exact enrolled `filename`, and
+`format`. Duplicate, empty, ambiguous or combined name/filename selectors fail
+closed. Verification measures current disk bytes on every request. This is
+point-in-time evidence, not a lease or proof of loaded memory or GPU VRAM.
+Consumers must open the returned path
 without following links and verify the returned digest and size on the opened
 file immediately before parsing; a path string alone is never a trust decision.
+
+The standalone helper currently supports regular GGUF and safetensors objects.
+It does not implement the main appliance's `diffusion-directory` storage/client
+contract; the main appliance embeds its own registry. This additive helper API
+change does not alter an already qualified main image.
+
+Scoped deployments configure all four `REGISTRY_{READ,VERIFY,PROMOTE,ADMIN}_TOKEN_PATH`
+files with distinct credentials of at least 32 bytes, private permissions and no
+links. Partial, duplicate, missing or unsafe credentials stop startup; the legacy
+key is not a fallback once scoped configuration is selected. Read credentials
+authorize stats, capacity, metadata listings and admission capability reads;
+verify credentials authorize path resolution and integrity operations. Promote
+credentials authorize admission v2 capability/prepare/commit and single-model
+receipt lookup, plus the legacy promotion endpoint when v2 is not required.
+Admin credentials authorize every operation, including delete/revoke and audit
+administration. Read/verify credentials cannot prepare or commit admission, and
+a promote credential cannot delete/revoke, read admin audit or resolve runtime
+paths. A read credential cannot resolve a verified path.
+
+Existing deployments may retain `SERVICE_TOKEN_PATH` with no scoped paths. That
+legacy mode gives one credential authority over all non-health operations and
+provides no scope separation. `securectl` accepts `REGISTRY_ADMIN_TOKEN_PATH` for
+scoped deployments and otherwise retains its legacy service credential. Its
+`path` output remains a JSON locator, including the new fields when present;
+typed parsing accepts both the legacy locator and numeric version 1 metadata.
 
 ## Artifact states
 
@@ -180,7 +215,8 @@ The registry stores the following metadata for each artifact:
 | `BIND_ADDR` | `127.0.0.1:8470` | HTTP listen address |
 | `REGISTRY_DIR` | `/registry` | Absolute, non-symlink artifact storage directory |
 | `REGISTRY_LOCK_PATH` | `/etc/secure-ai/policy/models.lock.yaml` | Baked-in fallback manifest |
-| `SERVICE_TOKEN_PATH` | `/run/secure-ai/service-token` | Bearer token file for auth |
+| `SERVICE_TOKEN_PATH` | `/run/secure-ai/service-token` | Legacy all-service Bearer token; used only when no scope paths are selected |
+| `REGISTRY_{READ,VERIFY,PROMOTE,ADMIN}_TOKEN_PATH` | unset | All four distinct private credential files select scoped authorization |
 | `INTEGRITY_RESULT_PATH` | `/var/lib/secure-ai/logs/integrity-last.json` | Last integrity check result |
 | `ALLOW_REMOTE_BIND` | unset | Must be exactly `true` before using a non-loopback `BIND_ADDR`; terminate TLS/mTLS in front |
 | `ALLOW_LEGACY_MANIFEST_MIGRATION` | unset | Reserved one-time migration opt-in; validate legacy state offline before enabling |
@@ -375,3 +411,12 @@ See [SECURITY.md](SECURITY.md), [THREAT_MODEL.md](THREAT_MODEL.md), and the
 ## License
 
 Apache-2.0
+
+## Manifest capacity and safety transitions
+
+Admission reserves enough manifest bytes and audit events to revoke and delete
+every live model. Authenticated `GET /v1/capacity` reports limits, safety reserve
+and maintenance status; an ordinary mutation that consumes the reserve returns
+HTTP 507. Existing history is retained. See [capacity and recovery](CAPACITY_RECOVERY.md)
+for legacy full-manifest limitations, persistence faults, and evidence-preserving
+checkpoint maintenance. Checkpoint export does not reclaim live manifest space.
